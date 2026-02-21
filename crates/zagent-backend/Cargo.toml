@@ -1,0 +1,45 @@
+[package]
+name = "zagent-backend"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zagent-core = { path = "../zagent-core" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+surrealdb = { version = "3.0.0", default-features = false, features = ["protocol-ws"] }
+axum = { version = "0.8", features = ["json"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2"
+tokio-stream = "0.1"
+rmcp = { version = "0.16", features = ["client", "transport-child-process"] }
+
+[features]
+default = []
+otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+
+[dependencies.tracing-opentelemetry]
+version = "0.28"
+optional = true
+
+[dependencies.opentelemetry]
+version = "0.27"
+optional = true
+
+[dependencies.opentelemetry_sdk]
+version = "0.27"
+features = ["rt-tokio"]
+optional = true
+
+[dependencies.opentelemetry-otlp]
+version = "0.27"
+features = ["tonic"]
+optional = true

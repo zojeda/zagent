@@ -1,0 +1,32 @@
+[workspace]
+members = ["crates/zagent-backend","crates/zagent-core", "crates/zagent-native", "crates/zagent-server", "crates/zagent-tui", "crates/zagent-ui-shared", "crates/zagent-web", "crates/zagent-web-dev"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+# -- Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+regex = "1"
+
+# -- Tracing
+tracing = { version = "0.1", features = ["default"] }
+
+# -- CLI
+clap = { version = "4", features = ["derive"] }
+
+# -- Error handling
+derive_more = { version = "2", features = ["from", "display"] }
+
+# -- Async
+tokio = { version = "1", features = ["full"] }
+
+# -- UUID
+uuid = { version = "1", features = ["v4"] }
+
+# -- Time
+chrono = { version = "0.4", features = ["serde"] }

@@ -1,0 +1,16 @@
+[package]
+name = "zagent-server"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+otel = ["zagent-backend/otel"]
+
+[dependencies]
+zagent-backend = { path = "../zagent-backend" }
+
+clap = { workspace = true }
+tokio = { workspace = true }
+dotenvy = "0.15"
+axum = "0.8"

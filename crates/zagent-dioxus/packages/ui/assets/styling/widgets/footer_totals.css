@@ -1,0 +1,32 @@
+.totals-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.totals-label {
+  margin-right: 0.3rem;
+  font-weight: 600;
+}
+
+.metric-pill {
+  display: inline-flex;
+  gap: 0.35rem;
+  align-items: baseline;
+  background: #f3f7f3;
+  border: 1px solid #e3ebe2;
+  border-radius: 999px;
+  padding: 0.18rem 0.5rem;
+}
+
+.metric-label {
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+
+.metric-value {
+  font: 600 0.86rem/1 "IBM Plex Mono", "Cascadia Mono", monospace;
+}

@@ -1,0 +1,18 @@
+[package]
+name = "zagent-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zagent-ui-shared = { path = "../zagent-ui-shared" }
+
+clap = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+ratatui = "0.30"
+crossterm = "0.29"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+arboard = "3"
+futures-util = "0.3"

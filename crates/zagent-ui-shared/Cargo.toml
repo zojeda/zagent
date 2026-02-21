@@ -1,0 +1,17 @@
+[package]
+name = "zagent-ui-shared"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ratatui = "0.30"
+tui-markdown = "0.3.7"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ratatui = { version = "0.30", default-features = false }
+tui-markdown = { version = "0.3.7", default-features = false }

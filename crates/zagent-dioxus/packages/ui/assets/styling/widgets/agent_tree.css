@@ -1,0 +1,175 @@
+.cards-root {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.agent-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 0.72rem;
+  background: linear-gradient(180deg, #fff 0, #fbfdfa 100%);
+  border-left: 3px solid var(--accent);
+  margin-left: calc(var(--depth) * 14px);
+}
+
+.agent-header {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  display: flex;
+  justify-content: flex-start;
+  gap: 0.8rem;
+  align-items: baseline;
+  cursor: pointer;
+  text-align: left;
+}
+
+.agent-header-main {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  gap: 0.8rem;
+  align-items: baseline;
+}
+
+.agent-caret {
+  display: inline-flex;
+  width: 0.9rem;
+  color: #526254;
+  transform: rotate(-90deg);
+  transition: transform 120ms ease;
+}
+
+.agent-caret.open {
+  transform: rotate(0deg);
+}
+
+.agent-content {
+  margin-top: 0.5rem;
+}
+
+.agent-title {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.agent-name {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.phase-badge {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border-radius: 999px;
+  padding: 0.12rem 0.42rem;
+}
+
+.badge-idle {
+  background: #edf2eb;
+  color: #5b6a5d;
+}
+
+.badge-active {
+  background: #deecff;
+  color: #2a5da2;
+}
+
+.badge-done {
+  background: #e5f2e8;
+  color: #2d6c4e;
+}
+
+.badge-tool {
+  background: #f4ede1;
+  color: #8a5d17;
+}
+
+.agent-depth {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.metric-grid {
+  margin-top: 0.55rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.reasoning-line,
+.handoff-line {
+  margin: 0.5rem 0 0;
+  font-size: 0.84rem;
+  color: #304033;
+}
+
+.handoff-block {
+  margin-top: 0.55rem;
+  padding: 0.35rem 0.5rem;
+  border: 1px dashed #d5ded3;
+  border-radius: 8px;
+  background: #f8fcf7;
+}
+
+.last-event {
+  margin: 0.6rem 0 0;
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.model-json-action-button {
+  border: 1px solid #cdd8cb;
+  background: #eef4eb;
+  color: #2f4732;
+  border-radius: 8px;
+  padding: 0.2rem 0.48rem;
+  font-size: 0.73rem;
+  cursor: pointer;
+}
+
+.timeline {
+  margin-top: 0.55rem;
+  border: 1px dashed #d7dfd4;
+  border-radius: 8px;
+  padding: 0.3rem 0.45rem;
+  background: #fbfdfb;
+}
+
+.timeline summary {
+  cursor: pointer;
+  color: #425345;
+  font-size: 0.8rem;
+}
+
+.timeline ul {
+  margin: 0.4rem 0 0.2rem 1.1rem;
+  padding: 0;
+}
+
+.timeline li {
+  margin: 0.2rem 0;
+  color: #4f5f53;
+  font: 0.78rem/1.35 "IBM Plex Mono", "Cascadia Mono", monospace;
+}
+
+.timeline-entry {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.timeline-entry-text {
+  flex: 1 1 auto;
+  min-width: 240px;
+}
+
+.child-cards {
+  margin-top: 0.7rem;
+  display: grid;
+  gap: 0.65rem;
+}

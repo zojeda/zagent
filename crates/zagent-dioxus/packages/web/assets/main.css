@@ -1,0 +1,104 @@
+:root {
+  --bg: #f6f7f5;
+  --panel: #ffffff;
+  --line: #d8ddd3;
+  --ink: #1f2c22;
+  --muted: #5b6a5d;
+  --accent: #2d6c4e;
+  --accent-soft: #e6f1ea;
+  --warn: #a34f29;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  color: var(--ink);
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  background:
+    radial-gradient(circle at 92% 6%, #dfeadf 0, transparent 38%),
+    radial-gradient(circle at 14% 96%, #f1e7da 0, transparent 34%),
+    var(--bg);
+}
+
+.json-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 14, 10, 0.34);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 60;
+}
+
+.json-modal {
+  width: min(980px, calc(100vw - 2rem));
+  max-height: calc(100vh - 2rem);
+  overflow: auto;
+  background: #ffffff;
+  border: 1px solid #cfd9cc;
+  border-radius: 14px;
+  padding: 0.8rem;
+}
+
+.json-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.8rem;
+}
+
+.json-modal-close {
+  border: 1px solid #c4d0c2;
+  background: #edf4eb;
+  color: #22362a;
+  border-radius: 8px;
+  padding: 0.3rem 0.55rem;
+  cursor: pointer;
+}
+
+.json-modal-status {
+  color: #4f6053;
+  font-size: 0.86rem;
+}
+
+.json-modal-error {
+  color: #9e4a28;
+  font-size: 0.86rem;
+}
+
+.json-modal-list {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.json-modal-event {
+  border: 1px solid #d8e0d4;
+  border-radius: 10px;
+  padding: 0.55rem;
+  background: #fbfdf9;
+}
+
+.json-modal-event h4 {
+  margin: 0 0 0.3rem;
+  font-size: 0.86rem;
+}
+
+.json-modal-meta {
+  margin: 0.2rem 0;
+  color: #5b6a5d;
+  font-size: 0.78rem;
+}
+
+.json-modal-pre {
+  margin: 0.45rem 0 0;
+  padding: 0.45rem;
+  border: 1px solid #d2ddd0;
+  border-radius: 8px;
+  background: #f6faf5;
+  overflow: auto;
+  white-space: pre-wrap;
+  font: 0.74rem/1.35 "IBM Plex Mono", "Cascadia Mono", monospace;
+}

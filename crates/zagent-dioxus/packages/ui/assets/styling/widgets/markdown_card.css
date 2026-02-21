@@ -1,0 +1,92 @@
+.markdown-grid {
+  margin-top: 0.8rem;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.65rem;
+}
+
+.markdown-card {
+  border: 1px solid #dfe6dc;
+  border-radius: 10px;
+  background: #fcfefd;
+  padding: 0.55rem 0.6rem;
+  min-height: 10rem;
+}
+
+.markdown-title {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.88rem;
+  letter-spacing: 0.02em;
+}
+
+.markdown-empty {
+  margin: 0;
+  color: #5f6e62;
+  font-size: 0.82rem;
+}
+
+.markdown-body {
+  font-size: 0.86rem;
+  line-height: 1.45;
+  color: #223126;
+  overflow: auto;
+  max-height: 18rem;
+}
+
+.markdown-body pre {
+  background: #f6f8fa;
+  border: 1px solid #e1e8e3;
+  border-radius: 8px;
+  padding: 0.5rem;
+  overflow-x: auto;
+}
+
+.markdown-body code {
+  font-family: "IBM Plex Mono", "Cascadia Mono", monospace;
+}
+
+.markdown-body pre code.hljs {
+  background: transparent;
+  padding: 0;
+}
+
+.markdown-body code.hljs {
+  color: #1f2328;
+}
+
+.markdown-body .hljs-keyword,
+.markdown-body .hljs-selector-tag,
+.markdown-body .hljs-built_in {
+  color: #cf222e;
+  font-weight: 600;
+}
+
+.markdown-body .hljs-type,
+.markdown-body .hljs-title,
+.markdown-body .hljs-function .hljs-title {
+  color: #8250df;
+}
+
+.markdown-body .hljs-string,
+.markdown-body .hljs-attr,
+.markdown-body .hljs-literal {
+  color: #0a7f44;
+}
+
+.markdown-body .hljs-number,
+.markdown-body .hljs-symbol,
+.markdown-body .hljs-bullet {
+  color: #0550ae;
+}
+
+.markdown-body .hljs-comment,
+.markdown-body .hljs-quote {
+  color: #6e7781;
+  font-style: italic;
+}
+
+@media (max-width: 820px) {
+  .markdown-grid {
+    grid-template-columns: 1fr;
+  }
+}

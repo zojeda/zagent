@@ -1,0 +1,17 @@
+[package]
+name = "zagent-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+regex = { workspace = true }
+tracing = { workspace = true }
+derive_more = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Async trait support
+async-trait = "0.1"

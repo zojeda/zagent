@@ -1,0 +1,121 @@
+// WIT (WebAssembly Interface Types) definitions for zAgent WASI component model.
+//
+// These interfaces define the host-injected tools that a WASI runtime
+// (like Wasmtime) provides to the zAgent guest component. This enables
+// the agent to execute shell commands, perform file I/O, and persist
+// sessions — even though WASI itself doesn't support process spawning.
+//
+// Usage:
+//   1. Host runtime implements these interfaces
+//   2. Guest agent (compiled to wasm32-wasip2) calls them via wit-bindgen
+//   3. Build with: cargo component build --target wasm32-wasip2
+
+package zagent:tools@0.1.0;
+
+/// Shell command execution — host-provided capability.
+/// The host implements process spawning on behalf of the sandboxed guest.
+interface shell-exec {
+    /// Result of executing a shell command
+    record exec-result {
+        /// Process exit code (0 = success)
+        exit-code: s32,
+        /// Standard output
+        stdout: string,
+        /// Standard error
+        stderr: string,
+    }
+
+    /// Request to execute a shell command
+    record exec-request {
+        /// The command to execute (passed to /bin/sh -c)
+        command: string,
+        /// Optional working directory
+        working-dir: option<string>,
+        /// Timeout in seconds (default: 60)
+        timeout-secs: option<u32>,
+    }
+
+    /// Execute a shell command on the host
+    exec: func(req: exec-request) -> result<exec-result, string>;
+}
+
+/// File system operations — host-provided capability.
+/// Extends beyond WASI's basic filesystem with convenience methods.
+interface file-ops {
+    /// Directory entry information
+    record dir-entry {
+        /// File or directory name
+        name: string,
+        /// Whether this entry is a directory
+        is-dir: bool,
+        /// File size in bytes (0 for directories)
+        size: u64,
+    }
+
+    /// Read a file's contents, optionally with line range
+    read-file: func(
+        path: string,
+        start-line: option<u32>,
+        end-line: option<u32>,
+    ) -> result<string, string>;
+
+    /// Write content to a file (creates parent directories if needed)
+    write-file: func(path: string, content: string) -> result<_, string>;
+
+    /// List directory contents
+    list-dir: func(path: string, recursive: bool) -> result<list<dir-entry>, string>;
+}
+
+/// Session persistence — host-provided storage.
+/// The host decides the backing store (SurrealDB, JSON files, etc.).
+interface session-store {
+    /// Session metadata for listing
+    record session-meta {
+        /// Unique session identifier
+        id: string,
+        /// Human-readable session name
+        name: string,
+        /// Model used in this session
+        model: string,
+        /// Number of messages in the session
+        message-count: u32,
+        /// ISO 8601 creation timestamp
+        created-at: string,
+    }
+
+    /// Save session state (serialized as JSON string)
+    save: func(id: string, data: string) -> result<_, string>;
+
+    /// Load session state by ID (returns JSON string)
+    load: func(id: string) -> result<string, string>;
+
+    /// Find a session by name (returns JSON string or none)
+    find-by-name: func(name: string) -> result<option<string>, string>;
+
+    /// List all sessions
+    list-all: func() -> result<list<session-meta>, string>;
+
+    /// Delete a session
+    delete: func(id: string) -> result<_, string>;
+}
+
+/// The zAgent world — defines what the guest component imports and exports.
+world agent {
+    // Host-provided capabilities (tools)
+    import shell-exec;
+    import file-ops;
+    import session-store;
+
+    // Standard WASI interfaces
+    import wasi:http/outgoing-handler@0.2.0;
+    import wasi:cli/environment@0.2.0;
+    import wasi:cli/stdout@0.2.0;
+    import wasi:cli/stderr@0.2.0;
+    import wasi:clocks/wall-clock@0.2.0;
+
+    /// Run the agent with a prompt, returning the final response
+    export run: func(prompt: string, model: string) -> result<string, string>;
+
+    /// Run the agent in interactive mode (reads stdin, writes stdout)
+    export run-interactive: func(model: string) -> result<_, string>;
+}

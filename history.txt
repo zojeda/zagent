@@ -1,0 +1,12 @@
+#V2
+SELECT * FROM sessions LIMIT 5;
+UPSERT sessions:test CONTENT {session_id:'test',name:'x',provider:'p',model:'m',created_at:time::now(),updated_at:time::now(),message_count:0,total_prompt_tokens:0,total_completion_tokens:0,system_prompt:'',working_dir:'',messages:[],tool_executions:[]};
+SELECT * FROM sessions WHERE id = sessions:test;
+SELECT id,session_id,name,created_at FROM sessions;
+UPSERT type::record('providers','openrouter') MERGE { provider_id:'openrouter', name:'openrouter', updated_at:time::now(), created_at: IF created_at = NONE THEN time::now() ELSE created_at END }; UPSERT type::record('models','openrouter__minimax_minimax_m2_5') MERGE { model_id:'openrouter__minimax_minimax_m2_5', name:'minimax/minimax-m2.5', provider_name:'openrouter', provider_ref:type::record('providers','openrouter'), updated_at:time::now(), created_at: IF created_at = NONE THEN time::now() ELSE created_at END }; UPSERT type::record('sessions','abc') CONTENT { session_id:'abc', name:'abc', provider:'openrouter', provider_ref:type::record('providers','openrouter'), model:'minimax/minimax-m2.5', model_ref:type::record('models','openrouter__minimax_minimax_m2_5'), created_at:'2026-02-20T02:00:00Z', updated_at:'2026-02-20T02:00:00Z', message_count:0, total_prompt_tokens:0, total_completion_tokens:0, system_prompt:'', working_dir:'', messages:[], tool_executions:[] }; SELECT id,session_id FROM sessions WHERE id = sessions:abc;
+SELECT count() AS n FROM sessions GROUP ALL;
+SELECT count() AS n FROM session_events GROUP ALL;
+SELECT count() AS n FROM sessions GROUP ALL;
+SELECT count() AS n FROM session_events GROUP ALL;
+SELECT count() AS n FROM sessions GROUP ALL;
+SELECT count() AS n FROM session_events GROUP ALL;

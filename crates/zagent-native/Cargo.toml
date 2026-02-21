@@ -1,0 +1,68 @@
+[package]
+name = "zagent-native"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "zagent"
+path = "src/main.rs"
+
+[dependencies]
+zagent-core = { path = "../zagent-core" }
+
+# -- Workspace deps
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true }
+derive_more = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# -- HTTP
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# -- SurrealDB
+surrealdb = { version = "3.0.0", default-features = false, features = ["protocol-ws"] }
+
+# -- REPL
+rustyline = "15"
+
+# -- Environment
+dotenvy = "0.15"
+
+# -- Tracing layers
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2"
+
+# -- Terminal colors
+colored = "3"
+
+# -- Async trait support  
+async-trait = "0.1"
+
+# -- Diff support
+udiffx = { version = "0.1", features = ["prompt"] }
+
+[features]
+default = []
+otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+
+[dependencies.tracing-opentelemetry]
+version = "0.28"
+optional = true
+
+[dependencies.opentelemetry]
+version = "0.27"
+optional = true
+
+[dependencies.opentelemetry_sdk]
+version = "0.27"
+features = ["rt-tokio"]
+optional = true
+
+[dependencies.opentelemetry-otlp]
+version = "0.27"
+features = ["tonic"]
+optional = true

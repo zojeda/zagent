@@ -1,0 +1,66 @@
+.chat-timeline {
+  margin-top: 0.8rem;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.7rem;
+}
+
+.chat-turn {
+  border: 1px solid #dfe6dc;
+  border-radius: 10px;
+  background: #fcfefd;
+  padding: 0.5rem 0.6rem;
+}
+
+.chat-turn-user {
+  border-left: 4px solid #3b82f6;
+  background: #f5f9ff;
+}
+
+.chat-turn-assistant {
+  border-left: 4px solid #10b981;
+}
+
+.chat-turn-header {
+  margin-bottom: 0.45rem;
+}
+
+.chat-turn-title {
+  margin: 0;
+  font-size: 0.88rem;
+  letter-spacing: 0.01em;
+}
+
+.chat-turn-body {
+  max-height: none;
+}
+
+.chat-turn-placeholder {
+  margin: 0.35rem 0 0;
+  color: #6a776b;
+  font-size: 0.82rem;
+}
+
+.chat-turn-details {
+  margin-top: 0.7rem;
+  border-top: 1px solid #e4ebe2;
+  padding-top: 0.65rem;
+}
+
+.chat-turn-details-toggle {
+  border: 1px solid #cfdacb;
+  background: #f6faf4;
+  color: #2f4731;
+  font-size: 0.8rem;
+  border-radius: 8px;
+  padding: 0.3rem 0.55rem;
+  cursor: pointer;
+}
+
+.chat-turn-details-toggle.collapsed {
+  background: #f9fbf9;
+}
+
+.chat-turn-details-body {
+  margin-top: 0.55rem;
+}
