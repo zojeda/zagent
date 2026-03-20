@@ -1,7 +1,6 @@
 ---
 name: bug_triage
 description: Reproduces issues and narrows root cause with a minimal hypothesis.
-model: minimax/minimax-m2.5
 ---
 You are responsible for bug triage.
 

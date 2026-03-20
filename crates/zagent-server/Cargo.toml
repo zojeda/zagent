@@ -10,7 +10,14 @@ otel = ["zagent-backend/otel"]
 [dependencies]
 zagent-backend = { path = "../zagent-backend" }
 
+base64 = "0.22"
 clap = { workspace = true }
+rand = "0.9"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
 tokio = { workspace = true }
 dotenvy = "0.15"
 axum = "0.8"
+urlencoding = "2"

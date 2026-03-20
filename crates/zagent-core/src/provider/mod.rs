@@ -1,9 +1,13 @@
+pub mod configured;
+pub mod openai;
 pub mod openrouter;
 pub mod types;
 
 use crate::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 use types::{ChatRequest, ChatResponse};
 
 /// HTTP request abstraction — platform-agnostic
@@ -43,6 +47,38 @@ pub struct HttpResponse {
 #[async_trait]
 pub trait HttpClient: Send + Sync {
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse>;
+}
+
+pub trait ProviderResolver: Send + Sync {
+    fn default_provider_name(&self) -> &str;
+    fn get(&self, name: &str) -> Option<&dyn Provider>;
+}
+
+pub struct StaticProviderResolver<'a> {
+    default_provider_name: &'a str,
+    providers: &'a HashMap<String, Arc<dyn Provider>>,
+}
+
+impl<'a> StaticProviderResolver<'a> {
+    pub fn new(
+        default_provider_name: &'a str,
+        providers: &'a HashMap<String, Arc<dyn Provider>>,
+    ) -> Self {
+        Self {
+            default_provider_name,
+            providers,
+        }
+    }
+}
+
+impl ProviderResolver for StaticProviderResolver<'_> {
+    fn default_provider_name(&self) -> &str {
+        self.default_provider_name
+    }
+
+    fn get(&self, name: &str) -> Option<&dyn Provider> {
+        self.providers.get(name).map(|provider| provider.as_ref())
+    }
 }
 
 /// Provider trait — encapsulates provider-specific API differences.

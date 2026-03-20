@@ -6,8 +6,12 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tracing::{Instrument, Span, info_span};
 use zagent_core::agent::{AgentConfig, AgentProgressEvent, run_agent_loop_with_progress};
-use zagent_core::config::{ProviderConfig, load_config};
-use zagent_core::provider::openrouter::OpenRouterProvider;
+use zagent_core::config::load_config;
+use zagent_core::provider::StaticProviderResolver;
+use zagent_core::provider::configured::{
+    build_configured_providers, ensure_requested_provider_available,
+    resolve_workspace_default_model,
+};
 use zagent_core::provider::types::Role;
 use zagent_core::provider::{Provider, ProviderModel};
 use zagent_core::session::{
@@ -45,9 +49,31 @@ impl RuntimeTarget {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionStoreTarget {
+    Surreal,
+    Json,
+    Memory,
+}
+
+impl SessionStoreTarget {
+    pub fn parse(input: &str) -> Result<Self, zagent_core::Error> {
+        match input {
+            "surreal" => Ok(Self::Surreal),
+            "json" => Ok(Self::Json),
+            "memory" => Ok(Self::Memory),
+            _ => Err(zagent_core::Error::config(
+                "session store must be one of: surreal, json, memory",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BackendOptions {
     pub runtime: RuntimeTarget,
+    pub session_store: SessionStoreTarget,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
     pub working_dir: String,
@@ -61,6 +87,7 @@ impl Default for BackendOptions {
     fn default() -> Self {
         Self {
             runtime: RuntimeTarget::Native,
+            session_store: SessionStoreTarget::Surreal,
             model: None,
             system_prompt: None,
             working_dir: std::env::current_dir()
@@ -199,6 +226,7 @@ struct EngineInner {
     mcp_servers_config: std::collections::BTreeMap<String, zagent_core::config::McpServerConfig>,
     working_dir: String,
     session_dir: String,
+    session_store: SessionStoreTarget,
     turn_lock: Mutex<()>,
     state: Mutex<EngineState>,
 }
@@ -211,21 +239,33 @@ pub struct BackendEngine {
 impl BackendEngine {
     pub async fn new(options: BackendOptions) -> Result<Self, zagent_core::Error> {
         let app_config = load_config(&options.working_dir)?;
-        let providers = build_providers(&app_config)?;
+        let providers = build_configured_providers(&app_config, &options.working_dir)?;
         if providers.is_empty() {
             return Err(zagent_core::Error::config(
-                "No providers configured. Add providers to zagent-config.yaml or set OPENROUTER_API_KEY.",
+                "No providers configured. Add providers to zagent-config.yaml or set OPENROUTER_API_KEY / OPENAI_API_KEY.",
             ));
         }
+        ensure_requested_provider_available(
+            app_config.default_provider.as_deref(),
+            options.model.as_deref(),
+            &app_config,
+            &providers,
+        )?;
         let provider_name = select_initial_provider(&options, &app_config, &providers)?;
 
         let mut config = AgentConfig {
             model: options.model.unwrap_or_default(),
+            custom_agent_default_model: resolve_workspace_default_model(&app_config, &providers)?,
             max_turns: options.max_turns,
             ..AgentConfig::default()
         };
         if config.model.trim().is_empty() {
             config.model = resolve_default_model(&provider_name, &app_config)?;
+        } else if let Some((prefixed_provider, stripped_model)) =
+            zagent_core::provider::configured::split_provider_model(&config.model)
+            && prefixed_provider == provider_name
+        {
+            config.model = stripped_model.to_string();
         }
         if let Some(system_prompt) = options.system_prompt {
             config.system_prompt = system_prompt;
@@ -241,6 +281,7 @@ impl BackendEngine {
         };
         let runtime = runtime::build_runtime(
             options.runtime,
+            options.session_store,
             &session_dir,
             &options.working_dir,
             mcp_manager,
@@ -267,6 +308,7 @@ impl BackendEngine {
             mcp_servers_config: app_config.mcp_servers.clone(),
             working_dir: options.working_dir,
             session_dir,
+            session_store: options.session_store,
             turn_lock: Mutex::new(()),
             state: Mutex::new(EngineState {
                 config,
@@ -381,7 +423,7 @@ impl BackendEngine {
 
     pub async fn migration_status(&self) -> Result<Vec<MigrationStatus>, zagent_core::Error> {
         let state = self.inner.state.lock().await;
-        let event_store = state.runtime.session_event_store.clone();
+        let event_store = state.runtime.session_admin_store.clone();
         drop(state);
         let store = event_store.ok_or_else(|| {
             zagent_core::Error::session("Migrations are not supported in this runtime")
@@ -391,7 +433,7 @@ impl BackendEngine {
 
     pub async fn migrate_to_latest(&self) -> Result<u32, zagent_core::Error> {
         let state = self.inner.state.lock().await;
-        let event_store = state.runtime.session_event_store.clone();
+        let event_store = state.runtime.session_admin_store.clone();
         drop(state);
         let store = event_store.ok_or_else(|| {
             zagent_core::Error::session("Migrations are not supported in this runtime")
@@ -402,7 +444,7 @@ impl BackendEngine {
 
     pub async fn migrate_to(&self, target_version: u32) -> Result<u32, zagent_core::Error> {
         let state = self.inner.state.lock().await;
-        let event_store = state.runtime.session_event_store.clone();
+        let event_store = state.runtime.session_admin_store.clone();
         drop(state);
         let store = event_store.ok_or_else(|| {
             zagent_core::Error::session("Migrations are not supported in this runtime")
@@ -416,7 +458,7 @@ impl BackendEngine {
     ) -> Result<mpsc::UnboundedReceiver<SessionEvent>, zagent_core::Error> {
         let state = self.inner.state.lock().await;
         let session_id = state.session.meta.id.clone();
-        let event_store = state.runtime.session_event_store.clone();
+        let event_store = state.runtime.session_admin_store.clone();
         drop(state);
 
         let store = event_store.ok_or_else(|| {
@@ -605,14 +647,12 @@ impl BackendEngine {
             config.visible_mcp_tools.clear();
         }
 
-        let provider = self
-            .inner
-            .providers
-            .get(&provider_name)
-            .ok_or_else(|| {
-                zagent_core::Error::config(format!("Provider '{provider_name}' is not configured"))
-            })?
-            .clone();
+        if !self.inner.providers.contains_key(&provider_name) {
+            return Err(zagent_core::Error::config(format!(
+                "Provider '{provider_name}' is not configured"
+            )));
+        }
+        let provider_resolver = StaticProviderResolver::new(&provider_name, &self.inner.providers);
         let mut streamed_events: Vec<UiEvent> = Vec::new();
         let mut stream_progress = |event: AgentProgressEvent| {
             if let Some(ui_event) = progress_event_to_ui_event(event) {
@@ -623,7 +663,7 @@ impl BackendEngine {
 
         let result = run_agent_loop_with_progress(
             http_client.as_ref(),
-            provider.as_ref(),
+            &provider_resolver,
             tools.as_ref(),
             &mut session,
             Some(store.as_ref()),
@@ -713,6 +753,7 @@ impl BackendEngine {
                         };
                         let next_runtime = runtime::build_runtime(
                             target,
+                            self.inner.session_store,
                             &self.inner.session_dir,
                             &self.inner.working_dir,
                             next_mcp,
@@ -1262,199 +1303,23 @@ async fn resolve_existing_session(
     store.load_session(name_or_id).await
 }
 
-fn build_providers(
-    app_config: &zagent_core::config::ZagentConfig,
-) -> Result<HashMap<String, Arc<dyn Provider>>, zagent_core::Error> {
-    let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-
-    for (provider_name, provider_config) in &app_config.providers {
-        if !provider_config.is_enabled() {
-            continue;
-        }
-        match provider_name.as_str() {
-            "openrouter" => {
-                let api_key = resolve_provider_api_key(provider_name, provider_config)?;
-                let mut provider = OpenRouterProvider::new(api_key);
-                if let Some(base_url) = resolve_provider_base_url(provider_name, provider_config) {
-                    provider = provider.with_base_url(base_url);
-                }
-                if let Some(app_name) = resolve_provider_app_name(provider_name, provider_config) {
-                    provider = provider.with_app_name(app_name);
-                }
-                if let Some(app_url) = resolve_provider_app_url(provider_name, provider_config) {
-                    provider = provider.with_app_url(app_url);
-                }
-                providers.insert(provider_name.clone(), Arc::new(provider));
-            }
-            _ => {}
-        }
-    }
-
-    if providers.is_empty()
-        && let Ok(api_key) = std::env::var("OPENROUTER_API_KEY")
-        && !api_key.trim().is_empty()
-    {
-        providers.insert(
-            "openrouter".to_string(),
-            Arc::new(OpenRouterProvider::new(api_key)),
-        );
-    }
-
-    Ok(providers)
-}
-
-fn resolve_provider_api_key(
-    provider_name: &str,
-    provider_config: &ProviderConfig,
-) -> Result<String, zagent_core::Error> {
-    let env_key = provider_env_var(provider_name, "API_KEY");
-    if let Ok(value) = std::env::var(&env_key)
-        && !value.trim().is_empty()
-    {
-        return Ok(value);
-    }
-    if let Some(custom_env_name) = provider_config.api_key_env.as_deref()
-        && let Ok(value) = std::env::var(custom_env_name)
-        && !value.trim().is_empty()
-    {
-        return Ok(value);
-    }
-    if let Some(raw) = provider_config.api_key.as_deref()
-        && !raw.trim().is_empty()
-    {
-        return Ok(raw.to_string());
-    }
-    if provider_name == "openrouter"
-        && let Ok(value) = std::env::var("OPENROUTER_API_KEY")
-        && !value.trim().is_empty()
-    {
-        return Ok(value);
-    }
-
-    Err(zagent_core::Error::config(format!(
-        "Provider '{provider_name}' is missing an API key. Set {} or configure api_key/api_key_env in zagent-config.yaml",
-        provider_env_var(provider_name, "API_KEY")
-    )))
-}
-
-fn resolve_provider_base_url(
-    provider_name: &str,
-    provider_config: &ProviderConfig,
-) -> Option<String> {
-    std::env::var(provider_env_var(provider_name, "BASE_URL"))
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| provider_config.base_url.clone())
-}
-
-fn resolve_provider_app_name(
-    provider_name: &str,
-    provider_config: &ProviderConfig,
-) -> Option<String> {
-    std::env::var(provider_env_var(provider_name, "APP_NAME"))
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| provider_config.app_name.clone())
-}
-
-fn resolve_provider_app_url(
-    provider_name: &str,
-    provider_config: &ProviderConfig,
-) -> Option<String> {
-    std::env::var(provider_env_var(provider_name, "APP_URL"))
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| provider_config.app_url.clone())
-}
-
-fn provider_env_var(provider_name: &str, suffix: &str) -> String {
-    let normalized: String = provider_name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("ZAGENT_PROVIDER_{normalized}_{suffix}")
-}
-
 fn select_initial_provider(
     options: &BackendOptions,
     app_config: &zagent_core::config::ZagentConfig,
     providers: &HashMap<String, Arc<dyn Provider>>,
 ) -> Result<String, zagent_core::Error> {
-    if let Ok(from_env) = std::env::var("ZAGENT_DEFAULT_PROVIDER")
-        && providers.contains_key(from_env.trim())
-    {
-        return Ok(from_env.trim().to_string());
-    }
-    if let Some(from_config) = app_config.default_provider.as_deref()
-        && providers.contains_key(from_config.trim())
-    {
-        return Ok(from_config.trim().to_string());
-    }
-
-    if let Some(model) = options.model.as_deref()
-        && model.trim().contains(':')
-    {
-        let mut split = model.trim().splitn(2, ':');
-        if let (Some(provider_name), Some(_)) = (split.next(), split.next())
-            && providers.contains_key(provider_name)
-        {
-            return Ok(provider_name.to_string());
-        }
-    }
-
-    if providers.contains_key("openrouter") {
-        return Ok("openrouter".to_string());
-    }
-
-    let mut names: Vec<String> = providers.keys().cloned().collect();
-    names.sort();
-    names
-        .into_iter()
-        .next()
-        .ok_or_else(|| zagent_core::Error::config("No providers configured"))
+    zagent_core::provider::configured::select_initial_provider(
+        app_config.default_provider.as_deref(),
+        options.model.as_deref(),
+        providers,
+    )
 }
 
 fn resolve_default_model(
     provider_name: &str,
     app_config: &zagent_core::config::ZagentConfig,
 ) -> Result<String, zagent_core::Error> {
-    if let Ok(model) = std::env::var("ZAGENT_DEFAULT_MODEL")
-        && !model.trim().is_empty()
-    {
-        return Ok(model);
-    }
-    if let Ok(model) = std::env::var(provider_env_var(provider_name, "DEFAULT_MODEL"))
-        && !model.trim().is_empty()
-    {
-        return Ok(model);
-    }
-    if let Some(model) = app_config
-        .providers
-        .get(provider_name)
-        .and_then(|p| p.default_model.clone())
-        .filter(|m| !m.trim().is_empty())
-    {
-        return Ok(model);
-    }
-    if let Some(model) = app_config
-        .default_model
-        .clone()
-        .filter(|m| !m.trim().is_empty())
-    {
-        return Ok(model);
-    }
-    if provider_name == "openrouter" {
-        return Ok("anthropic/claude-sonnet-4".to_string());
-    }
-    Err(zagent_core::Error::config(format!(
-        "No default model configured for provider '{provider_name}'. Set ZAGENT_DEFAULT_MODEL or configure default_model in zagent-config.yaml"
-    )))
+    zagent_core::provider::configured::resolve_default_model(provider_name, app_config)
 }
 
 fn dirs_home() -> String {

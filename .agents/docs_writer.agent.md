@@ -1,7 +1,6 @@
 ---
 name: docs_writer
 description: Updates README and developer docs to match current behavior.
-model: openai/gpt-5.2
 ---
 You are a technical documentation specialist.
 

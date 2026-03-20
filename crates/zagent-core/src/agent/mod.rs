@@ -11,8 +11,9 @@ use chrono::Utc;
 use tracing::{Instrument, info, info_span, trace, warn};
 
 use crate::Result;
+use crate::provider::configured::split_provider_model;
 use crate::provider::types::{ChatRequest, ChatResponse, Message, ToolCall};
-use crate::provider::{HttpClient, Provider};
+use crate::provider::{HttpClient, ProviderResolver};
 use crate::session::{SessionEvent, SessionState, SessionStore, ToolExecutionRecord};
 use crate::tools::ToolRegistry;
 use custom_agents::{
@@ -25,6 +26,7 @@ use custom_agents::{
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub model: String,
+    pub custom_agent_default_model: String,
     pub max_turns: u32,
     pub max_tool_output_chars: usize,
     pub system_prompt: String,
@@ -37,6 +39,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             model: "minimax/minimax-m2.5".to_string(),
+            custom_agent_default_model: "minimax/minimax-m2.5".to_string(),
             max_turns: 50,
             max_tool_output_chars: 50_000,
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
@@ -65,6 +68,9 @@ Always tell the user what you're doing and why."#;
 const AGENTS_FILE_NAME: &str = "AGENTS.md";
 const MAX_AGENTS_FILES: usize = 64;
 const MAX_AGENTS_FILE_BYTES: usize = 32_000;
+const SKILL_FILE_NAME: &str = "SKILL.md";
+const MAX_SKILL_FILES: usize = 128;
+const MAX_SKILL_FILE_BYTES: usize = 32_000;
 const WALK_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", "dist", "logs"];
 const MAX_HANDOFF_DEPTH: u32 = 16;
 
@@ -74,25 +80,33 @@ struct AgentsInstructionFile {
     content: String,
 }
 
+#[derive(Debug, Clone)]
+struct SkillDefinition {
+    name: String,
+    description: String,
+    relative_path_from_cwd: String,
+}
+
 fn build_effective_system_prompt(
     base_system_prompt: &str,
     working_dir: &str,
     custom_agents: &[CustomAgentDefinition],
 ) -> String {
     let instruction_files = collect_agents_instruction_files(working_dir);
+    let skills = collect_skill_definitions(working_dir);
     let mut out = String::with_capacity(base_system_prompt.len() + 4096);
     out.push_str(base_system_prompt);
 
     if !instruction_files.is_empty() {
-        out.push_str("\n\n# AGENTS Instructions Context\n");
+        out.push_str("\n\n# Rules\n");
         out.push_str(
-            "The following AGENTS.md files were discovered for this workspace. \
+            "The following always-on workspace rules were discovered from AGENTS.md files. \
 Each block includes the path relative to the current working directory.\n\n",
         );
 
         for file in &instruction_files {
             out.push_str(&format!(
-                "## AGENTS file: {}\n",
+                "## Rule source: {}\n",
                 file.relative_path_from_cwd
             ));
             out.push_str(file.content.trim());
@@ -104,6 +118,23 @@ Each block includes the path relative to the current working directory.\n\n",
 When AGENTS.md files conflict, prioritize the file closest to the file being updated or \
 processed. More specific (deeper, nearer) files override broader ones.",
         );
+    }
+
+    if !skills.is_empty() {
+        out.push_str("\n\n# Available Skills\n");
+        out.push_str(
+            "Task-specific skills are available as external prompt files. Keep the base prompt \
+lean: only read a skill with file_read when it is directly relevant to the task or the user \
+explicitly asks for it. When you load a skill, follow its instructions in addition to the rules \
+above.\n\n",
+        );
+
+        for skill in &skills {
+            out.push_str(&format!(
+                "- {}: {} [source: {}]\n",
+                skill.name, skill.description, skill.relative_path_from_cwd
+            ));
+        }
     }
 
     push_custom_agents_prompt_section(&mut out, custom_agents);
@@ -220,6 +251,132 @@ fn collect_descendant_agents_paths(cwd: &Path) -> Vec<PathBuf> {
     out
 }
 
+fn collect_skill_definitions(working_dir: &str) -> Vec<SkillDefinition> {
+    let cwd = resolve_path(working_dir);
+    let mut discovered = collect_descendant_skill_paths(&cwd);
+    discovered.sort();
+    discovered.truncate(MAX_SKILL_FILES);
+
+    discovered
+        .into_iter()
+        .filter_map(|path| load_skill_definition(&cwd, &path))
+        .collect()
+}
+
+fn collect_descendant_skill_paths(cwd: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![cwd.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        if out.len() >= MAX_SKILL_FILES {
+            break;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if file_type.is_file() && name_str == SKILL_FILE_NAME {
+                out.push(path);
+                if out.len() >= MAX_SKILL_FILES {
+                    break;
+                }
+                continue;
+            }
+            if !file_type.is_dir() {
+                continue;
+            }
+            if file_type.is_symlink() {
+                continue;
+            }
+            if WALK_SKIP_DIRS.iter().any(|skip| name_str == *skip) {
+                continue;
+            }
+            stack.push(path);
+        }
+    }
+
+    out
+}
+
+fn load_skill_definition(cwd: &Path, path: &Path) -> Option<SkillDefinition> {
+    let bytes = fs::read(path).ok()?;
+    let clipped = if bytes.len() > MAX_SKILL_FILE_BYTES {
+        &bytes[..MAX_SKILL_FILE_BYTES]
+    } else {
+        &bytes
+    };
+    let content = String::from_utf8_lossy(clipped).to_string();
+    let (manifest, body) = parse_skill_frontmatter(&content);
+
+    let name = manifest
+        .name
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| infer_skill_name(path));
+    let description = manifest
+        .description
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| infer_skill_description(&body))
+        .unwrap_or_else(|| format!("Task-specific instructions for {name}"));
+
+    let relative = path
+        .strip_prefix(cwd)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+    Some(SkillDefinition {
+        name,
+        description,
+        relative_path_from_cwd: relative,
+    })
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct SkillManifest {
+    name: Option<String>,
+    description: Option<String>,
+}
+
+fn parse_skill_frontmatter(content: &str) -> (SkillManifest, String) {
+    let Some(rest) = content.strip_prefix("---\n") else {
+        return (SkillManifest::default(), content.to_string());
+    };
+    let Some(end) = rest.find("\n---\n") else {
+        return (SkillManifest::default(), content.to_string());
+    };
+    let meta_block = &rest[..end];
+    let body = &rest[end + "\n---\n".len()..];
+    let parsed = serde_yaml::from_str::<SkillManifest>(meta_block).unwrap_or_default();
+    (parsed, body.to_string())
+}
+
+fn infer_skill_name(path: &Path) -> String {
+    path.parent()
+        .and_then(|parent| parent.file_name())
+        .map(|value| value.to_string_lossy().to_string())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Unnamed Skill".to_string())
+}
+
+fn infer_skill_description(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| {
+            line.trim_start_matches('#')
+                .trim()
+                .trim_end_matches('.')
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+}
+
 fn find_git_root(start: &Path) -> PathBuf {
     let mut cursor = start.to_path_buf();
     loop {
@@ -324,10 +481,36 @@ struct ToolExecutionOutcome {
     forwarded_events: Vec<AgentProgressEvent>,
 }
 
+fn resolve_model_and_provider(
+    configured_model: &str,
+    providers: &dyn ProviderResolver,
+    fallback_provider_name: &str,
+) -> Result<(String, String)> {
+    if let Some((provider_name, model_name)) = split_provider_model(configured_model) {
+        if providers.get(provider_name).is_none() {
+            return Err(crate::Error::config(format!(
+                "Provider '{provider_name}' is not configured for model '{configured_model}'"
+            )));
+        }
+        return Ok((provider_name.to_string(), model_name.to_string()));
+    }
+
+    if providers.get(fallback_provider_name).is_none() {
+        return Err(crate::Error::config(format!(
+            "Provider '{fallback_provider_name}' is not configured"
+        )));
+    }
+
+    Ok((
+        fallback_provider_name.to_string(),
+        configured_model.to_string(),
+    ))
+}
+
 /// Run the agentic loop: send messages to LLM, execute tool calls, repeat until done.
 pub async fn run_agent_loop(
     http_client: &dyn HttpClient,
-    provider: &dyn Provider,
+    providers: &dyn ProviderResolver,
     tools: &ToolRegistry,
     session: &mut SessionState,
     session_store: Option<&dyn SessionStore>,
@@ -336,7 +519,7 @@ pub async fn run_agent_loop(
 ) -> Result<AgentResult> {
     run_agent_loop_with_progress(
         http_client,
-        provider,
+        providers,
         tools,
         session,
         session_store,
@@ -349,7 +532,7 @@ pub async fn run_agent_loop(
 
 pub async fn run_agent_loop_with_progress(
     http_client: &dyn HttpClient,
-    provider: &dyn Provider,
+    providers: &dyn ProviderResolver,
     tools: &ToolRegistry,
     session: &mut SessionState,
     session_store: Option<&dyn SessionStore>,
@@ -358,16 +541,21 @@ pub async fn run_agent_loop_with_progress(
     progress: Option<&mut (dyn FnMut(AgentProgressEvent) + Send)>,
 ) -> Result<AgentResult> {
     let progress_emitter = progress.map(ProgressEmitter::new);
-    let custom_agents_all = collect_custom_agents(&session.working_dir, &config.model);
+    let custom_agents_all =
+        collect_custom_agents(&session.working_dir, &config.custom_agent_default_model);
     let mut effective_config = config.clone();
     let mut effective_user_message = user_message.to_string();
+    let mut effective_provider_name = providers.default_provider_name().to_string();
     if effective_config.active_custom_agent_id.is_none() {
         let (selected, routed_message, _explicit) =
             resolve_user_invocation(user_message, &custom_agents_all);
         effective_user_message = routed_message;
         if let Some(agent) = selected {
             effective_config.active_custom_agent_id = Some(agent.id.clone());
-            effective_config.model = agent.model.clone();
+            let (provider_name, model_name) =
+                resolve_model_and_provider(&agent.model, providers, &effective_provider_name)?;
+            effective_provider_name = provider_name;
+            effective_config.model = model_name;
 
             let mut routed_prompt = format!(
                 "{}\n\n# Invoked Agent Role\nName: {}\nDescription: {}\n\n{}",
@@ -426,6 +614,7 @@ pub async fn run_agent_loop_with_progress(
     let loop_span = info_span!(
         "agent_loop",
         session_id = %session.meta.id,
+        provider = %effective_provider_name,
         model = %effective_config.model,
         active_custom_agent = %effective_config.active_custom_agent_id.as_deref().unwrap_or("root"),
         handoff_depth = effective_config.handoff_depth,
@@ -438,6 +627,7 @@ pub async fn run_agent_loop_with_progress(
         let user_request_span = info_span!(
             "user_initiated",
             session_id = %session.meta.id,
+            provider = %effective_provider_name,
             model = %effective_config.model,
             active_custom_agent = %effective_config.active_custom_agent_id.as_deref().unwrap_or("root"),
             handoff_depth = effective_config.handoff_depth,
@@ -537,9 +727,18 @@ pub async fn run_agent_loop_with_progress(
                         ChatRequest::new(&effective_config.model, messages).with_tools(tool_defs);
                     let tool_count = request.tools.as_ref().map(|t| t.len()).unwrap_or(0);
                     let request_payload = serde_json::to_value(&request)?;
+                    let active_provider =
+                        providers
+                            .get(&effective_provider_name)
+                            .ok_or_else(|| {
+                                crate::Error::config(format!(
+                                    "Provider '{}' is not configured",
+                                    effective_provider_name
+                                ))
+                            })?;
                     let model_call_span = info_span!(
                         "model_call",
-                        provider = %provider.name(),
+                        provider = %active_provider.name(),
                         model = %effective_config.model,
                         turn = turn,
                         message_count = request.messages.len(),
@@ -557,7 +756,7 @@ pub async fn run_agent_loop_with_progress(
                     async {
                         // Call the model provider.
                         let llm_start = Instant::now();
-                        let http_req = provider.build_http_request(&request)?;
+                        let http_req = active_provider.build_http_request(&request)?;
                         emit_progress_event(
                             progress_emitter,
                             session_store,
@@ -566,7 +765,7 @@ pub async fn run_agent_loop_with_progress(
                                 agent: active_agent_name.clone(),
                                 handoff_depth: effective_config.handoff_depth,
                                 turn,
-                                provider: provider.name().to_string(),
+                                provider: active_provider.name().to_string(),
                                 model: effective_config.model.clone(),
                                 message_count: request.messages.len(),
                                 tool_count,
@@ -618,7 +817,7 @@ pub async fn run_agent_loop_with_progress(
 
                         // Parse response
                         let chat_response: ChatResponse =
-                            provider.parse_response(&http_resp.body)?;
+                            active_provider.parse_response(&http_resp.body)?;
                         let response_credits = extract_credits_remaining(&http_resp.headers);
                         credits_remaining = response_credits.or(credits_remaining);
 
@@ -754,7 +953,7 @@ pub async fn run_agent_loop_with_progress(
                         .await;
                         let tool_result = execute_tool_call(
                             http_client,
-                            provider,
+                            providers,
                             tools,
                             tc,
                             effective_config.max_tool_output_chars,
@@ -763,6 +962,7 @@ pub async fn run_agent_loop_with_progress(
                             &handoff_defaults_by_tool,
                             progress_emitter,
                             &effective_config,
+                            &effective_provider_name,
                             &session.working_dir,
                             session_store,
                             &session.meta.id,
@@ -985,7 +1185,7 @@ pub async fn run_agent_loop_with_progress(
 /// Execute a single tool call and return (output, latency_ms) or error
 async fn execute_tool_call(
     http_client: &dyn HttpClient,
-    provider: &dyn Provider,
+    providers: &dyn ProviderResolver,
     tools: &ToolRegistry,
     tool_call: &ToolCall,
     max_output_chars: usize,
@@ -994,6 +1194,7 @@ async fn execute_tool_call(
     handoff_defaults_by_tool: &HashMap<String, CustomAgentHandoffDefinition>,
     _progress_emitter: Option<ProgressEmitter<'_>>,
     parent_config: &AgentConfig,
+    parent_provider_name: &str,
     working_dir: &str,
     parent_session_store: Option<&dyn SessionStore>,
     parent_session_id: &str,
@@ -1076,12 +1277,19 @@ async fn execute_tool_call(
                 model: handoff_defaults
                     .and_then(|h| h.model.clone())
                     .unwrap_or_else(|| child_agent.model.clone()),
+                custom_agent_default_model: parent_config.custom_agent_default_model.clone(),
                 max_turns: parent_config.max_turns,
                 max_tool_output_chars: parent_config.max_tool_output_chars,
                 system_prompt: child_prompt,
                 active_custom_agent_id: Some(child_agent.id.clone()),
                 handoff_depth: parent_config.handoff_depth.saturating_add(1),
                 visible_mcp_tools: parent_config.visible_mcp_tools.clone(),
+            };
+            let (child_provider_name, child_model_name) =
+                resolve_model_and_provider(&child_config.model, providers, parent_provider_name)?;
+            let child_config = AgentConfig {
+                model: child_model_name,
+                ..child_config
             };
 
             let handoff_span_name = format!("agent_handoff <{}>", child_agent.name);
@@ -1093,13 +1301,14 @@ async fn execute_tool_call(
                 parent_handoff_depth = parent_config.handoff_depth,
                 child_agent_id = %child_agent.id,
                 child_agent_name = %child_agent.name,
+                child_provider = %child_provider_name,
                 child_model = %child_config.model
             );
 
             let mut child_session = SessionState::new(
                 format!("handoff-{}", child_agent.id),
                 child_config.model.clone(),
-                provider.name().to_string(),
+                child_provider_name.clone(),
                 child_config.system_prompt.clone(),
                 working_dir.to_string(),
             );
@@ -1122,7 +1331,7 @@ async fn execute_tool_call(
             let child_result = async {
                 Box::pin(run_agent_loop_with_progress(
                     http_client,
-                    provider,
+                    providers,
                     tools,
                     &mut child_session,
                     forwarding_store
@@ -1538,4 +1747,141 @@ fn extract_credits_remaining(headers: &[(String, String)]) -> Option<f64> {
         }
         None
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{Provider, StaticProviderResolver};
+    use async_trait::async_trait;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestProvider {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl Provider for TestProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn base_url(&self) -> &str {
+            "https://example.invalid"
+        }
+
+        fn api_key(&self) -> &str {
+            "test-key"
+        }
+    }
+
+    fn make_temp_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("zagent-{label}-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn collects_skill_definitions_from_workspace() {
+        let cwd = make_temp_dir("skills");
+        let skill_dir = cwd.join(".skills").join("rust-refactor");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join(SKILL_FILE_NAME),
+            r#"---
+name: Rust Refactor
+description: Apply the house Rust refactor workflow.
+---
+# Rust Refactor
+Use this skill when doing multi-file Rust cleanup.
+"#,
+        )
+        .expect("write skill file");
+
+        let discovered = collect_skill_definitions(cwd.to_str().expect("cwd utf8"));
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].name, "Rust Refactor");
+        assert_eq!(
+            discovered[0].description,
+            "Apply the house Rust refactor workflow."
+        );
+        assert_eq!(
+            discovered[0].relative_path_from_cwd,
+            ".skills/rust-refactor/SKILL.md"
+        );
+
+        fs::remove_dir_all(cwd).expect("remove temp dir");
+    }
+
+    #[test]
+    fn effective_prompt_includes_rules_and_skill_catalog() {
+        let cwd = make_temp_dir("prompt");
+        fs::write(cwd.join(AGENTS_FILE_NAME), "Root rule: keep diffs small.\n")
+            .expect("write agents file");
+        let skill_dir = cwd.join("skills").join("release");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join(SKILL_FILE_NAME),
+            "# Release Skill\nFollow the release checklist.\n",
+        )
+        .expect("write skill file");
+
+        let prompt =
+            build_effective_system_prompt("Base prompt", cwd.to_str().expect("cwd utf8"), &[]);
+        assert!(prompt.contains("# Rules"));
+        assert!(prompt.contains("Root rule: keep diffs small."));
+        assert!(prompt.contains("# Available Skills"));
+        assert!(prompt.contains("release: Release Skill [source: skills/release/SKILL.md]"));
+        assert!(prompt.contains("only read a skill with file_read"));
+
+        fs::remove_dir_all(cwd).expect("remove temp dir");
+    }
+
+    #[test]
+    fn provider_prefixed_agent_models_use_configured_provider() {
+        let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        providers.insert(
+            "openrouter".to_string(),
+            Arc::new(TestProvider { name: "openrouter" }),
+        );
+        providers.insert(
+            "openai".to_string(),
+            Arc::new(TestProvider { name: "openai" }),
+        );
+        let resolver = StaticProviderResolver::new("openai", &providers);
+
+        let (provider_name, model_name) =
+            resolve_model_and_provider("openrouter:minimax/minimax-m2.5", &resolver, "openai")
+                .expect("provider-prefixed model should resolve");
+
+        assert_eq!(provider_name, "openrouter");
+        assert_eq!(model_name, "minimax/minimax-m2.5");
+    }
+
+    #[test]
+    fn provider_prefixed_agent_models_require_configured_provider() {
+        let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        providers.insert(
+            "openai".to_string(),
+            Arc::new(TestProvider { name: "openai" }),
+        );
+        let resolver = StaticProviderResolver::new("openai", &providers);
+
+        let err =
+            resolve_model_and_provider("openrouter:minimax/minimax-m2.5", &resolver, "openai")
+                .expect_err("missing provider should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("Provider 'openrouter' is not configured")
+        );
+    }
 }

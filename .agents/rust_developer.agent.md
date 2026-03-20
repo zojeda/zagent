@@ -1,7 +1,6 @@
 ---
 name: rust_developer
 description: Implements Rust changes with full filesystem write capabilities.
-model: minimax/minimax-m2.5
 tools: ['file_read', 'file_write', 'file_edit', 'list_dir', 'shell_exec']
 ---
 You are a Rust implementation agent.

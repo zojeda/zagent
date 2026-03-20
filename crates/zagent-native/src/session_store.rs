@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use surrealdb::Surreal;
-use surrealdb::engine::any::Any;
+use surrealdb::engine::any::{Any, connect};
 use surrealdb::opt::auth::Root;
 
 use zagent_core::Result;
@@ -31,8 +32,8 @@ struct SessionRow {
     name: String,
     provider: Option<String>,
     model: Option<String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
+    created_at: String,
+    updated_at: String,
     message_count: u32,
     total_prompt_tokens: u64,
     total_completion_tokens: u64,
@@ -50,16 +51,11 @@ impl SurrealSessionStore {
         let database =
             std::env::var("SURREALDB_DB").unwrap_or_else(|_| "session_storage".to_string());
 
-        let db = Surreal::new::<Any>(endpoint)
+        let db = connect(endpoint)
             .await
             .map_err(|e| zagent_core::Error::session(format!("Failed to open SurrealDB: {e}")))?;
 
-        db.signin(Root {
-            username: &username,
-            password: &password,
-        })
-        .await
-        .map_err(|e| {
+        db.signin(Root { username, password }).await.map_err(|e| {
             zagent_core::Error::session(format!("Failed to authenticate SurrealDB: {e}"))
         })?;
 
@@ -84,9 +80,10 @@ impl SurrealSessionStore {
                 zagent_core::Error::session(format!("Failed to query legacy sessions: {e}"))
             })?;
 
-        let rows: Vec<LegacySessionRow> = response.take(0).map_err(|e| {
+        let rows: Vec<serde_json::Value> = response.take(0).map_err(|e| {
             zagent_core::Error::session(format!("Failed to decode legacy session rows: {e}"))
         })?;
+        let rows: Vec<LegacySessionRow> = decode_rows(rows, "legacy session rows")?;
 
         for row in rows {
             let mut session = decode_session_payload(&row.payload_json)?;
@@ -296,6 +293,27 @@ fn slug_key(input: &str) -> String {
     }
 }
 
+fn decode_rows<T: DeserializeOwned>(rows: Vec<serde_json::Value>, label: &str) -> Result<Vec<T>> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(decode_value(row, label)?);
+    }
+    Ok(out)
+}
+
+fn decode_value<T: DeserializeOwned>(value: serde_json::Value, label: &str) -> Result<T> {
+    serde_json::from_value(value)
+        .map_err(|e| zagent_core::Error::session(format!("Failed to decode {label}: {e}")))
+}
+
+fn parse_datetime(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| {
+            zagent_core::Error::session(format!("Failed to parse datetime '{value}': {e}"))
+        })
+}
+
 #[async_trait]
 impl SessionStore for SurrealSessionStore {
     async fn save_session(&self, session: &SessionState) -> Result<()> {
@@ -305,7 +323,7 @@ impl SessionStore for SurrealSessionStore {
 
         self.db
             .query(
-                "UPSERT type::record('sessions', $id) CONTENT { session_id: $session_id, name: $name, provider: $provider, provider_ref: type::record('providers', $provider_id), model: $model, model_ref: type::record('models', $model_id), created_at: $created_at, updated_at: $updated_at, message_count: $message_count, total_prompt_tokens: $total_prompt_tokens, total_completion_tokens: $total_completion_tokens, system_prompt: $system_prompt, working_dir: $working_dir, messages: $messages, tool_executions: $tool_executions }",
+                "UPSERT type::record('sessions', $id) CONTENT { session_id: $session_id, name: $name, provider: $provider, provider_ref: type::record('providers', $provider_id), model: $model, model_ref: type::record('models', $model_id), created_at: <datetime>$created_at, updated_at: <datetime>$updated_at, message_count: $message_count, total_prompt_tokens: $total_prompt_tokens, total_completion_tokens: $total_completion_tokens, system_prompt: $system_prompt, working_dir: $working_dir, messages: $messages, tool_executions: $tool_executions }",
             )
             .bind(("id", session.meta.id.clone()))
             .bind(("session_id", session.meta.id.clone()))
@@ -324,7 +342,11 @@ impl SessionStore for SurrealSessionStore {
             .bind(("messages", serde_json::json!([])))
             .bind(("tool_executions", serde_json::json!([])))
             .await
-            .map_err(|e| zagent_core::Error::session(format!("Failed to save session: {e}")))?;
+            .map_err(|e| zagent_core::Error::session(format!("Failed to save session: {e}")))?
+            .check()
+            .map_err(|e| {
+                zagent_core::Error::session(format!("Failed to save session (statement): {e}"))
+            })?;
 
         Ok(())
     }
@@ -332,17 +354,19 @@ impl SessionStore for SurrealSessionStore {
     async fn load_session(&self, id: &str) -> Result<SessionState> {
         let mut response = self
             .db
-            .query("SELECT * FROM ONLY type::record('sessions', $id)")
+            .query("SELECT session_id, name, provider, model, <string>created_at AS created_at, <string>updated_at AS updated_at, message_count, total_prompt_tokens, total_completion_tokens, system_prompt, working_dir, messages, tool_executions FROM ONLY type::record('sessions', $id)")
             .bind(("id", id.to_string()))
             .await
             .map_err(|e| zagent_core::Error::session(format!("Failed to load session: {e}")))?;
 
-        let row: Option<SessionRow> = response.take(0).map_err(|e| {
+        let row: Option<serde_json::Value> = response.take(0).map_err(|e| {
             zagent_core::Error::session(format!("Failed to decode session row: {e}"))
         })?;
 
-        let row =
-            row.ok_or_else(|| zagent_core::Error::session(format!("Session '{id}' not found")))?;
+        let row: SessionRow = row
+            .map(|value| decode_value(value, "session row"))
+            .transpose()?
+            .ok_or_else(|| zagent_core::Error::session(format!("Session '{id}' not found")))?;
 
         let mut session = SessionState {
             meta: SessionMeta {
@@ -350,8 +374,8 @@ impl SessionStore for SurrealSessionStore {
                 name: row.name,
                 model: row.model.unwrap_or_else(|| "unknown".to_string()),
                 provider: row.provider.unwrap_or_else(|| "unknown".to_string()),
-                created_at: row.created_at,
-                updated_at: row.updated_at,
+                created_at: parse_datetime(&row.created_at)?,
+                updated_at: parse_datetime(&row.updated_at)?,
                 message_count: row.message_count,
                 total_prompt_tokens: row.total_prompt_tokens,
                 total_completion_tokens: row.total_completion_tokens,
@@ -380,28 +404,30 @@ impl SessionStore for SurrealSessionStore {
     async fn list_sessions(&self) -> Result<Vec<SessionMeta>> {
         let mut response = self
             .db
-            .query("SELECT session_id, name, provider, model, created_at, updated_at, message_count, total_prompt_tokens, total_completion_tokens FROM sessions ORDER BY updated_at DESC")
+            .query("SELECT session_id, name, provider, model, <string>created_at AS created_at, <string>updated_at AS updated_at, message_count, total_prompt_tokens, total_completion_tokens FROM sessions ORDER BY updated_at DESC")
             .await
             .map_err(|e| zagent_core::Error::session(format!("Failed to list sessions: {e}")))?;
 
-        let rows: Vec<SessionRow> = response.take(0).map_err(|e| {
+        let rows: Vec<serde_json::Value> = response.take(0).map_err(|e| {
             zagent_core::Error::session(format!("Failed to decode session rows: {e}"))
         })?;
+        let rows: Vec<SessionRow> = decode_rows(rows, "session rows")?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| SessionMeta {
-                id: row.session_id,
-                name: row.name,
-                model: row.model.unwrap_or_else(|| "unknown".to_string()),
-                provider: row.provider.unwrap_or_else(|| "unknown".to_string()),
-                created_at: row.created_at,
-                updated_at: row.updated_at,
-                message_count: row.message_count,
-                total_prompt_tokens: row.total_prompt_tokens,
-                total_completion_tokens: row.total_completion_tokens,
+        rows.into_iter()
+            .map(|row| {
+                Ok(SessionMeta {
+                    id: row.session_id,
+                    name: row.name,
+                    model: row.model.unwrap_or_else(|| "unknown".to_string()),
+                    provider: row.provider.unwrap_or_else(|| "unknown".to_string()),
+                    created_at: parse_datetime(&row.created_at)?,
+                    updated_at: parse_datetime(&row.updated_at)?,
+                    message_count: row.message_count,
+                    total_prompt_tokens: row.total_prompt_tokens,
+                    total_completion_tokens: row.total_completion_tokens,
+                })
             })
-            .collect())
+            .collect()
     }
 
     async fn delete_session(&self, id: &str) -> Result<()> {
@@ -515,7 +541,7 @@ impl SessionStore for SurrealSessionStore {
 
         self.db
             .query(
-                "UPSERT type::record('session_events', $id) CONTENT { event_id: $event_id, session_id: $session_id, session_ref: type::record('sessions', $session_id), sequence: $sequence, parent_event_id: $parent_event_id, parent_event_ref: IF $parent_event_id = NONE THEN NONE ELSE type::record('session_events', $parent_event_id) END, kind: $kind, phase: $phase, agent: $agent, handoff_depth: $handoff_depth, turn: $turn, provider: $provider, provider_ref: IF $provider_ref_id = NONE THEN NONE ELSE type::record('providers', $provider_ref_id) END, model: $model, model_ref: IF $model_ref_id = NONE THEN NONE ELSE type::record('models', $model_ref_id) END, tool_name: $tool_name, success: $success, finish_reason: $finish_reason, latency_ms: $latency_ms, prompt_tokens: $prompt_tokens, completion_tokens: $completion_tokens, total_tokens: $total_tokens, cached_prompt_tokens: $cached_prompt_tokens, cost_usd: $cost_usd, credits_remaining: $credits_remaining, arguments: $arguments, result: $result, payload: $payload, created_at: $created_at }",
+                "UPSERT type::record('session_events', $id) CONTENT { event_id: $event_id, session_id: $session_id, session_ref: type::record('sessions', $session_id), sequence: $sequence, parent_event_id: $parent_event_id, parent_event_ref: IF $parent_event_id = NONE THEN NONE ELSE type::record('session_events', $parent_event_id) END, kind: $kind, phase: $phase, agent: $agent, handoff_depth: $handoff_depth, turn: $turn, provider: $provider, provider_ref: IF $provider_ref_id = NONE THEN NONE ELSE type::record('providers', $provider_ref_id) END, model: $model, model_ref: IF $model_ref_id = NONE THEN NONE ELSE type::record('models', $model_ref_id) END, tool_name: $tool_name, success: $success, finish_reason: $finish_reason, latency_ms: $latency_ms, prompt_tokens: $prompt_tokens, completion_tokens: $completion_tokens, total_tokens: $total_tokens, cached_prompt_tokens: $cached_prompt_tokens, cost_usd: $cost_usd, credits_remaining: $credits_remaining, arguments: $arguments, result: $result, payload: $payload, created_at: <datetime>$created_at }",
             )
             .bind(("id", event_to_store.id.clone()))
             .bind(("event_id", event_to_store.id.clone()))
@@ -560,7 +586,11 @@ impl SessionStore for SurrealSessionStore {
             .bind(("payload", event_to_store.payload.clone()))
             .bind(("created_at", event_to_store.created_at.to_rfc3339()))
             .await
-            .map_err(|e| zagent_core::Error::session(format!("Failed to append event: {e}")))?;
+            .map_err(|e| zagent_core::Error::session(format!("Failed to append event: {e}")))?
+            .check()
+            .map_err(|e| {
+                zagent_core::Error::session(format!("Failed to append event (statement): {e}"))
+            })?;
 
         Ok(())
     }
@@ -579,9 +609,10 @@ impl SessionStore for SurrealSessionStore {
             .await
             .map_err(|e| zagent_core::Error::session(format!("Failed to list events: {e}")))?;
 
-        let mut events: Vec<SessionEvent> = response
+        let rows: Vec<serde_json::Value> = response
             .take(0)
             .map_err(|e| zagent_core::Error::session(format!("Failed to decode events: {e}")))?;
+        let mut events: Vec<SessionEvent> = decode_rows(rows, "session events")?;
 
         if let Some(seq) = after_sequence {
             events.retain(|event| event.sequence.unwrap_or(0) > seq);

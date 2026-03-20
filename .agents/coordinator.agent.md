@@ -1,7 +1,6 @@
 ---
 name: coordinator
 description: Orchestrates work strictly through delegation.
-model: minimax/minimax-m2.5
 user-invokable: true
 invoke-default: true
 tools: []
@@ -10,7 +9,6 @@ handoffs:
     agent: planning
     prompt: Create a concrete execution plan first, then delegate implementation/review tasks as needed.
     send: true
-    model: minimax/minimax-m2.5
 ---
 You are the top-level coordinator.
 

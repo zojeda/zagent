@@ -19,7 +19,7 @@ A Codex CLI alternative built in Rust, focused on **multi-LLM provider support**
 ### Prerequisites
 
 - Rust 1.85+ (2024 edition)
-- An [OpenRouter](https://openrouter.ai/) API key
+- Either an [OpenRouter](https://openrouter.ai/) API key or OpenAI credentials
 
 ### Installation
 
@@ -27,8 +27,19 @@ A Codex CLI alternative built in Rust, focused on **multi-LLM provider support**
 git clone https://github.com/your-user/zAgent.git
 cd zAgent
 cp .env.example .env
-# Edit .env and add your OPENROUTER_API_KEY
+# Edit .env and add your provider credentials
 cargo build --release
+```
+
+### Task Runner
+
+This repo uses [`just`](https://github.com/casey/just) instead of `make`.
+
+```bash
+just help
+just build
+just check
+just run-server
 ```
 
 ### Usage
@@ -82,6 +93,13 @@ cargo run -p zagent-native -- -m google/gemini-2.5-pro -p "Refactor this functio
 cargo run -p zagent-native -- -m minimax/minimax-m2.5 -p "Write unit tests for src/lib.rs"
 ```
 
+**Choose a provider explicitly:**
+
+```bash
+cargo run -p zagent-native -- -m openai:gpt-5.2 -p "Refactor this Rust module"
+cargo run -p zagent-native -- -m openrouter:anthropic/claude-sonnet-4 -p "Summarize the repo"
+```
+
 #### Backend + Frontends
 
 **Start the backend server:**
@@ -123,13 +141,35 @@ trunk serve --proxy-backend http://127.0.0.1:8787/api --proxy-rewrite /api
 - **Native**: SurrealDB session store + full toolset (`shell_exec`, `file_read`, `file_write`, `file_edit`, `list_dir`, `websearch`, `webfetch`)
 - **WASI**: JSON session store + restricted toolset (`file_read`, `file_write`, `file_edit`, `list_dir`, `websearch`, `webfetch`) - no shell access
 
-### Workspace Instructions (`AGENTS.md`)
+### Rules (`AGENTS.md`)
 
-zAgent automatically scans for `AGENTS.md` files starting from the working directory, walking up to the git root and down into subdirectories (skipping `target/`, `node_modules/`, `dist/`, and `logs/`). Discovered instructions are appended to the system prompt in path order with these rules:
+zAgent automatically scans for `AGENTS.md` files starting from the working directory, walking up to the git root and down into subdirectories (skipping `target/`, `node_modules/`, `dist/`, and `logs/`). Discovered files are injected into the system prompt as always-on workspace rules:
 
 - Closer, more specific `AGENTS.md` files take precedence over broader ones.
 - Up to 64 instruction files are loaded, each capped at 32 KB.
 - Explicit user chat instructions always override `AGENTS.md` guidance.
+
+### Skills (`SKILL.md`)
+
+zAgent also scans the workspace for `SKILL.md` files and adds a compact skill catalog to the system prompt. Each entry includes the skill name, description, and relative path so the agent can load the full file with `file_read` only when it is relevant to the task.
+
+- Skills are discovered recursively from the working directory, using the same skipped directories as `AGENTS.md`.
+- Up to 128 skill files are cataloged, each capped at 32 KB when metadata is parsed.
+- If frontmatter is present, `name` and `description` are shown in the prompt.
+- Without frontmatter, zAgent derives the skill name from the parent folder and the description from the first non-empty body line.
+
+Example skill layout:
+
+```md
+.skills/rust-refactor/SKILL.md
+---
+name: Rust Refactor
+description: Apply the team's Rust refactor workflow.
+---
+# Rust Refactor
+
+Use this skill when making coordinated Rust changes across modules.
+```
 
 ### Custom Agents (`.agents`)
 
@@ -160,6 +200,7 @@ Each file becomes a dynamic handoff tool (`handoff_<agent-name-slug>`). Handoffs
 
 Optional manifest fields:
 
+- `model`: optional. If omitted, the agent uses the default model for the current session/run. If provided, it may be either a bare model ID or `provider:model`.
 - `tools`: runtime tool access policy (enforced). This filters both:
   - tool definitions exposed to the model
   - runtime execution (blocked if not allowed)
@@ -168,7 +209,7 @@ Optional manifest fields:
   - `agent`: target agent name.
   - `prompt`: additional prompt appended to the handoff request.
   - `send`: set `false` to prevent sending `context` to the child agent.
-  - `model`: override the child agent model for this handoff.
+  - `model`: optional override for the child agent model for this handoff. If omitted, the child agent's own model is used, which itself falls back to the session default when not specified.
 
 Tool policy patterns:
 
@@ -470,7 +511,11 @@ The architecture is designed for **single-server, single-active-session** operat
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `OPENROUTER_API_KEY` | Yes | Your OpenRouter API key |
+| `OPENROUTER_API_KEY` | No | Your OpenRouter API key |
+| `OPENAI_API_KEY` | No | Your OpenAI API key for `openai` provider API-key auth |
+| `ZAGENT_PROVIDER_OPENAI_AUTH_METHOD` | No | `api_key` or `chatgpt_subscription` |
+| `ZAGENT_PROVIDER_OPENAI_ACCESS_TOKEN` | No | Existing ChatGPT bearer access token for subscription auth |
+| `ZAGENT_PROVIDER_OPENAI_ACCOUNT_ID` | No | ChatGPT account/workspace id for subscription auth |
 | `RUST_LOG` | No | Override tracing filter (e.g., `zagent=debug`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP/gRPC endpoint for OpenTelemetry (requires `--features otel`) |
 | `OTEL_SERVICE_NAME` | No | Service name for OTLP traces (default: `zagent`) |
@@ -480,6 +525,40 @@ Copy `.env.example` to `.env` to configure:
 ```bash
 cp .env.example .env
 ```
+
+### Provider Config Examples
+
+`zagent-config.yaml` using OpenAI API-key auth:
+
+```yaml
+default_provider: openai
+providers:
+  openai:
+    auth_method: api_key
+    default_model: gpt-5.2
+```
+
+`zagent-config.yaml` using OpenAI ChatGPT subscription auth:
+
+```yaml
+default_provider: openai
+providers:
+  openai:
+    auth_method: chatgpt_subscription
+    access_token_env: ZAGENT_PROVIDER_OPENAI_ACCESS_TOKEN
+    account_id_env: ZAGENT_PROVIDER_OPENAI_ACCOUNT_ID
+    default_model: gpt-5.2
+```
+
+Generate ChatGPT subscription credentials into a local gitignored `.env-auth` file:
+
+```bash
+cargo run -p zagent-server -- auth openai
+```
+
+The server and native CLI load `.env` and `.env-auth` automatically on startup.
+
+This first pass stores the current access token plus account/workspace id. It does not implement refresh-token reuse on startup, so you may need to rerun the auth command when the token expires.
 
 ## Adding a New Provider
 

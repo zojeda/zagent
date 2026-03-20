@@ -1,6 +1,8 @@
 /target
 .env
+.env-auth
 logs/
 *.db
 *.db-wal
 *.db-shm
+auth.json

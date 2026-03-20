@@ -24,9 +24,19 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
+    pub auth_method: Option<ProviderAuthMethod>,
+    #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub access_token: Option<String>,
+    #[serde(default)]
+    pub access_token_env: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub account_id_env: Option<String>,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
@@ -46,11 +56,26 @@ impl ProviderConfig {
         if other.enabled.is_some() {
             self.enabled = other.enabled;
         }
+        if other.auth_method.is_some() {
+            self.auth_method = other.auth_method;
+        }
         if other.api_key.is_some() {
             self.api_key = other.api_key.clone();
         }
         if other.api_key_env.is_some() {
             self.api_key_env = other.api_key_env.clone();
+        }
+        if other.access_token.is_some() {
+            self.access_token = other.access_token.clone();
+        }
+        if other.access_token_env.is_some() {
+            self.access_token_env = other.access_token_env.clone();
+        }
+        if other.account_id.is_some() {
+            self.account_id = other.account_id.clone();
+        }
+        if other.account_id_env.is_some() {
+            self.account_id_env = other.account_id_env.clone();
         }
         if other.base_url.is_some() {
             self.base_url = other.base_url.clone();
@@ -65,6 +90,13 @@ impl ProviderConfig {
             self.default_model = other.default_model.clone();
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthMethod {
+    ApiKey,
+    ChatgptSubscription,
 }
 
 impl ZagentConfig {

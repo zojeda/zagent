@@ -686,6 +686,36 @@ Planner instructions.
     }
 
     #[test]
+    fn collect_custom_agents_uses_default_model_when_manifest_omits_it() {
+        let root = std::env::temp_dir().join(format!(
+            "zagent-custom-agent-default-model-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".agents")).expect("create .agents");
+        fs::write(
+            root.join(".agents/reviewer.agent.md"),
+            r#"---
+name: Reviewer Agent
+description: Reviews changes
+user-invokable: true
+---
+Reviewer instructions.
+"#,
+        )
+        .expect("write agent file");
+
+        let agents =
+            collect_custom_agents(&root.to_string_lossy(), "openrouter:minimax/minimax-m2.5");
+        assert_eq!(agents.len(), 1);
+        let agent = &agents[0];
+        assert_eq!(agent.name, "Reviewer Agent");
+        assert_eq!(agent.model, "openrouter:minimax/minimax-m2.5");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn rejects_manifest_id_field() {
         let root = std::env::temp_dir().join(format!(
             "zagent-custom-agent-id-test-{}",

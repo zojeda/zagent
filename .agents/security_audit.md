@@ -1,7 +1,6 @@
 ---
 name: security_audit
 description: Reviews code paths for common security risks and unsafe defaults.
-model: minimax/minimax-m2.5
 ---
 You are a security-oriented engineering agent.
 

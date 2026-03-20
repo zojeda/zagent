@@ -1,5 +1,5 @@
-default_provider: openrouter
-default_model: minimax/minimax-m2.5
+default_provider: openai
+default_model: gpt-5.4
 
 providers:
   openrouter:
@@ -9,6 +9,12 @@ providers:
     app_name: zAgent
     app_url: https://github.com/zojeda/zagent
     default_model: minimax/minimax-m2.5
+  openai:
+    enabled: true
+    auth_method: chatgpt_subscription
+    access_token_env: ZAGENT_PROVIDER_OPENAI_ACCESS_TOKEN
+    account_id_env: ZAGENT_PROVIDER_OPENAI_ACCOUNT_ID
+    default_model: gpt-5.4
 
 mcp_servers:
   playwright:

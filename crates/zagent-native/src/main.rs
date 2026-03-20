@@ -1,14 +1,23 @@
 mod platform;
 mod session_store;
+mod session_store_json;
 mod tools;
 mod tracing_setup;
 
+use std::sync::Arc;
+
 use clap::Parser;
 use colored::Colorize;
+use tracing::warn;
 use tracing::{Instrument, info, info_span};
 
 use zagent_core::agent::{AgentConfig, run_agent_loop};
-use zagent_core::provider::openrouter::OpenRouterProvider;
+use zagent_core::config::load_config;
+use zagent_core::provider::configured::{
+    build_configured_providers, ensure_requested_provider_available, resolve_default_model,
+    resolve_workspace_default_model, select_initial_provider, split_provider_model,
+};
+use zagent_core::provider::{ProviderResolver, StaticProviderResolver};
 use zagent_core::session::{SessionState, SessionStore};
 
 /// zAgent — Observable multi-LLM coding agent
@@ -20,8 +29,8 @@ struct Cli {
     prompt: Option<String>,
 
     /// Model to use (e.g., "anthropic/claude-sonnet-4", "openai/gpt-4o")
-    #[arg(short, long, default_value = "anthropic/claude-sonnet-4")]
-    model: String,
+    #[arg(short, long)]
+    model: Option<String>,
 
     /// Custom system prompt
     #[arg(short, long)]
@@ -66,8 +75,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load .env if present
-    dotenvy::dotenv().ok();
+    load_env_files();
 
     let cli = Cli::parse();
 
@@ -75,42 +83,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _guard = tracing_setup::init_tracing(&cli.log_dir, cli.verbose);
 
     info!(
-        model = %cli.model,
+        model = ?cli.model,
         "zAgent starting"
     );
 
-    // Set up session store early (needed for --list-sessions, --delete-session)
-    let session_dir = cli.session_dir.clone().unwrap_or_else(dirs_session_default);
-    let session_endpoint = resolve_surreal_endpoint(&session_dir);
-    let session_store = session_store::SurrealSessionStore::new(&session_endpoint).await?;
-
-    // Handle session management commands that don't need an API key
-    if cli.list_sessions {
-        return handle_list_sessions(&session_store).await;
-    }
-    if let Some(ref name_or_id) = cli.delete_session {
-        return handle_delete_session(&session_store, name_or_id).await;
-    }
-
-    // Get API key (required for actual agent work)
-    let api_key = std::env::var("OPENROUTER_API_KEY").map_err(|_| {
-        zagent_core::Error::config(
-            "OPENROUTER_API_KEY not set. Create a .env file with OPENROUTER_API_KEY=sk-or-...",
-        )
-    })?;
-
-    // Set up provider
-    let provider = OpenRouterProvider::new(api_key);
-
-    // Set up HTTP client
-    let http_client = platform::NativeHttpClient::new();
-
-    // Working directory
-    let working_dir = cli.working_dir.unwrap_or_else(|| {
+    let working_dir = cli.working_dir.clone().unwrap_or_else(|| {
         std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string())
     });
+
+    let app_config = load_config(&working_dir)?;
+    let providers = build_configured_providers(&app_config, &working_dir)?;
+    if providers.is_empty() {
+        return Err(zagent_core::Error::config(
+            "No providers configured. Add providers to zagent-config.yaml or set OPENROUTER_API_KEY / OPENAI_API_KEY.",
+        ).into());
+    }
+    ensure_requested_provider_available(
+        app_config.default_provider.as_deref(),
+        cli.model.as_deref(),
+        &app_config,
+        &providers,
+    )?;
+    let provider_name = select_initial_provider(
+        app_config.default_provider.as_deref(),
+        cli.model.as_deref(),
+        &providers,
+    )?;
+    if !providers.contains_key(&provider_name) {
+        return Err(zagent_core::Error::config(format!(
+            "Provider '{provider_name}' is not configured"
+        ))
+        .into());
+    }
+    let provider_resolver = StaticProviderResolver::new(&provider_name, &providers);
+
+    // Set up session store early (needed for --list-sessions, --delete-session)
+    let session_dir = cli.session_dir.clone().unwrap_or_else(dirs_session_default);
+    let session_store = build_session_store(&session_dir).await?;
+
+    // Handle session management commands that don't need an API key
+    if cli.list_sessions {
+        return handle_list_sessions(session_store.as_ref()).await;
+    }
+    if let Some(ref name_or_id) = cli.delete_session {
+        return handle_delete_session(session_store.as_ref(), name_or_id).await;
+    }
+
+    // Set up HTTP client
+    let http_client = platform::NativeHttpClient::new();
 
     // Set up tools
     let tool_registry = tools::register_all_tools(&working_dir);
@@ -122,8 +144,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Agent config
-    let mut config = AgentConfig::default();
-    config.model = cli.model.clone();
+    let mut config = AgentConfig {
+        model: String::new(),
+        ..AgentConfig::default()
+    };
+    if let Some(model) = cli.model.clone() {
+        config.model = model;
+    }
+    config.custom_agent_default_model = resolve_workspace_default_model(&app_config, &providers)?;
+    if let Some((prefixed_provider, stripped_model)) = split_provider_model(&config.model)
+        && prefixed_provider == provider_name
+    {
+        config.model = stripped_model.to_string();
+    }
+    if config.model.trim().is_empty() {
+        config.model = resolve_default_model(&provider_name, &app_config)?;
+    }
     config.max_turns = cli.max_turns;
     if let Some(ref system) = cli.system {
         config.system_prompt = system.clone();
@@ -131,9 +167,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load or create session
     let mut session = resolve_session(
-        &session_store,
+        session_store.as_ref(),
         cli.session.as_deref(),
         cli.new_session.as_deref(),
+        &provider_name,
         &config,
         &working_dir,
     )
@@ -142,8 +179,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{}",
         format!(
-            "━━━ zAgent ━━━ model: {} ━━━ session: {} ━━━",
-            cli.model.cyan(),
+            "━━━ zAgent ━━━ provider: {} ━━━ model: {} ━━━ session: {} ━━━",
+            provider_name.cyan(),
+            config.model.cyan(),
             session.meta.name.green()
         )
         .bold()
@@ -166,10 +204,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Single-shot mode
         run_single_prompt(
             &http_client,
-            &provider,
+            &provider_resolver,
             &tool_registry,
             &mut session,
-            &session_store,
+            session_store.as_ref(),
             &config,
             &prompt,
         )
@@ -179,10 +217,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // REPL mode
         run_repl(
             &http_client,
-            &provider,
+            &provider_resolver,
             &tool_registry,
             &mut session,
-            &session_store,
+            session_store.as_ref(),
             &config,
         )
         .instrument(session_span)
@@ -192,12 +230,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn load_env_files() {
+    dotenvy::from_filename(".env").ok();
+    dotenvy::from_filename_override(".env-auth").ok();
+}
+
 async fn run_single_prompt(
     http_client: &platform::NativeHttpClient,
-    provider: &OpenRouterProvider,
+    providers: &dyn ProviderResolver,
     tools: &zagent_core::tools::ToolRegistry,
     session: &mut SessionState,
-    session_store: &session_store::SurrealSessionStore,
+    session_store: &dyn SessionStore,
     config: &AgentConfig,
     prompt: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -206,10 +249,10 @@ async fn run_single_prompt(
 
     let result = run_agent_loop(
         http_client,
-        provider,
+        providers,
         tools,
         session,
-        Some(session_store as &dyn SessionStore),
+        Some(session_store),
         config,
         prompt,
     )
@@ -236,10 +279,10 @@ async fn run_single_prompt(
 
 async fn run_repl(
     http_client: &platform::NativeHttpClient,
-    provider: &OpenRouterProvider,
+    providers: &dyn ProviderResolver,
     tools: &zagent_core::tools::ToolRegistry,
     session: &mut SessionState,
-    session_store: &session_store::SurrealSessionStore,
+    session_store: &dyn SessionStore,
     config: &AgentConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut rl = rustyline::DefaultEditor::new()
@@ -286,10 +329,10 @@ async fn run_repl(
 
                 match run_agent_loop(
                     http_client,
-                    provider,
+                    providers,
                     tools,
                     session,
-                    Some(session_store as &dyn SessionStore),
+                    Some(session_store),
                     config,
                     input,
                 )
@@ -344,7 +387,7 @@ async fn run_repl(
 async fn handle_repl_command(
     cmd: &str,
     session: &SessionState,
-    session_store: &session_store::SurrealSessionStore,
+    session_store: &dyn SessionStore,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     match cmd {
         "/help" | "/h" => {
@@ -392,7 +435,7 @@ async fn handle_repl_command(
 }
 
 async fn handle_list_sessions(
-    session_store: &session_store::SurrealSessionStore,
+    session_store: &dyn SessionStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let sessions = session_store.list_sessions().await?;
 
@@ -425,7 +468,7 @@ async fn handle_list_sessions(
 }
 
 async fn handle_delete_session(
-    session_store: &session_store::SurrealSessionStore,
+    session_store: &dyn SessionStore,
     name_or_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Try by name first
@@ -444,9 +487,10 @@ async fn handle_delete_session(
 }
 
 async fn resolve_session(
-    session_store: &session_store::SurrealSessionStore,
+    session_store: &dyn SessionStore,
     resume: Option<&str>,
     new_name: Option<&str>,
+    provider_name: &str,
     config: &AgentConfig,
     working_dir: &str,
 ) -> Result<SessionState, Box<dyn std::error::Error>> {
@@ -491,9 +535,10 @@ async fn resolve_session(
                 return Ok(session);
             }
             Err(e) => {
-                return Err(Box::new(zagent_core::Error::session(format!(
+                return Err(zagent_core::Error::session(format!(
                     "Session '{name_or_id}' not found: {e}"
-                ))));
+                ))
+                .into());
             }
         }
     }
@@ -508,7 +553,7 @@ async fn resolve_session(
     let session = SessionState::new(
         &name,
         &config.model,
-        "openrouter",
+        provider_name,
         &config.system_prompt,
         working_dir,
     );
@@ -533,9 +578,34 @@ fn dirs_session_default() -> String {
     format!("{}/.zagent", dirs_home())
 }
 
-fn resolve_surreal_endpoint(session_dir_or_endpoint: &str) -> String {
+async fn build_session_store(
+    session_dir_or_endpoint: &str,
+) -> Result<Arc<dyn SessionStore>, Box<dyn std::error::Error>> {
     if session_dir_or_endpoint.contains("://") {
-        return session_dir_or_endpoint.to_string();
+        let store = session_store::SurrealSessionStore::new(session_dir_or_endpoint).await?;
+        return Ok(Arc::new(store));
     }
-    std::env::var("SURREALDB_URL").unwrap_or_else(|_| "ws://127.0.0.1:8000".to_string())
+
+    if let Ok(endpoint) = std::env::var("SURREALDB_URL")
+        && !endpoint.trim().is_empty()
+    {
+        match session_store::SurrealSessionStore::new(&endpoint).await {
+            Ok(store) => return Ok(Arc::new(store)),
+            Err(err) => {
+                warn!(
+                    endpoint = %endpoint,
+                    error = %err,
+                    "Failed to connect to SurrealDB from SURREALDB_URL; falling back to JSON session store"
+                );
+            }
+        }
+    }
+
+    let path = format!("{session_dir_or_endpoint}/native-sessions.json");
+    warn!(
+        path = %path,
+        "SURREALDB_URL not set; using JSON session store for native CLI"
+    );
+    let store = session_store_json::JsonSessionStore::new(path)?;
+    Ok(Arc::new(store))
 }

@@ -1,7 +1,6 @@
 ---
 name: rust_review
 description: Reviews Rust changes for correctness, safety, and regressions.
-model: minimax/minimax-m2.5
 ---
 You are a Rust code review specialist.
 

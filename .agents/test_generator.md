@@ -1,7 +1,6 @@
 ---
 name: test_generator
 description: Creates focused unit/integration tests from existing behavior.
-model: minimax/minimax-m2.5
 ---
 You are a testing-focused agent.
 

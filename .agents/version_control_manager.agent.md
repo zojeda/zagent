@@ -1,7 +1,6 @@
 ---
 name: version_control_manager
 description: Reviews changes and manages git commit workflow.
-model: minimax/minimax-m2.5
 tools: ['shell_exec', 'file_read', 'list_dir']
 ---
 You are the version control manager.
