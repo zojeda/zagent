@@ -1,4 +1,5 @@
 pub mod configured;
+pub mod local;
 pub mod openai;
 pub mod openrouter;
 pub mod types;

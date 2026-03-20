@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::Provider;
+use super::local::LocalProvider;
 use super::openai::OpenAiProvider;
 use super::openrouter::OpenRouterProvider;
 use crate::config::{ProviderAuthMethod, ProviderConfig, ZagentConfig};
@@ -38,6 +39,21 @@ pub fn build_configured_providers(
                 }
                 if let Some(app_url) = resolve_provider_app_url(provider_name, provider_config) {
                     provider = provider.with_app_url(app_url);
+                }
+                let provider: Arc<dyn Provider> = Arc::new(provider);
+                Ok(Some(provider))
+            })(),
+            "local" => (|| {
+                let mut provider = LocalProvider::new(resolve_required_provider_base_url(
+                    provider_name,
+                    provider_config,
+                )?);
+                if let Some(api_key) = resolve_optional_provider_api_key(
+                    provider_name,
+                    provider_config,
+                    auth_file.provider(provider_name),
+                ) {
+                    provider = provider.with_api_key(api_key);
                 }
                 let provider: Arc<dyn Provider> = Arc::new(provider);
                 Ok(Some(provider))
@@ -165,11 +181,20 @@ pub fn select_initial_provider(
 }
 
 pub fn ensure_requested_provider_available(
-    _default_provider: Option<&str>,
+    default_provider: Option<&str>,
     model: Option<&str>,
     _app_config: &ZagentConfig,
     providers: &SharedProviderMap,
 ) -> Result<()> {
+    if let Some(requested) = default_provider.map(str::trim)
+        && !requested.is_empty()
+        && !providers.contains_key(requested)
+    {
+        return Err(Error::config(format!(
+            "Configured default provider '{requested}' is not available. Check its configuration and authentication."
+        )));
+    }
+
     if let Ok(from_env) = std::env::var("ZAGENT_DEFAULT_PROVIDER") {
         let requested = from_env.trim();
         if !requested.is_empty() && !providers.contains_key(requested) {
@@ -220,10 +245,15 @@ pub fn resolve_default_model(provider_name: &str, app_config: &ZagentConfig) -> 
     match provider_name {
         "openrouter" => Ok("anthropic/claude-sonnet-4".to_string()),
         "openai" => Ok("gpt-5.2".to_string()),
-        _ => Err(Error::config(format!(
-            "No default model configured for provider '{provider_name}'. Set ZAGENT_DEFAULT_MODEL or configure default_model in zagent-config.yaml"
-        ))),
+        _ => Err(missing_default_model_error(provider_name)),
     }
+}
+
+fn missing_default_model_error(provider_name: &str) -> Error {
+    Error::config(format!(
+        "No default model configured for provider '{provider_name}'. Set {} or configure providers.{provider_name}.default_model or default_model in zagent-config.yaml",
+        provider_env_var(provider_name, "DEFAULT_MODEL")
+    ))
 }
 
 pub fn resolve_workspace_default_model(
@@ -377,6 +407,43 @@ fn resolve_provider_api_key(
             provider_env_var(provider_name, "API_KEY")
         ))),
     }
+}
+
+fn resolve_optional_provider_api_key(
+    provider_name: &str,
+    provider_config: &ProviderConfig,
+    auth_file: Option<&ProviderAuthFile>,
+) -> Option<String> {
+    let env_key = provider_env_var(provider_name, "API_KEY");
+    std::env::var(&env_key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            provider_config
+                .api_key_env
+                .as_deref()
+                .and_then(|name| std::env::var(name).ok())
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            provider_config
+                .api_key
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| auth_file.and_then(|auth| auth.api_key.clone()))
+}
+
+fn resolve_required_provider_base_url(
+    provider_name: &str,
+    provider_config: &ProviderConfig,
+) -> Result<String> {
+    resolve_provider_base_url(provider_name, provider_config).ok_or_else(|| {
+        Error::config(format!(
+            "Provider '{provider_name}' requires base_url. Set {} or configure providers.{provider_name}.base_url in zagent-config.yaml",
+            provider_env_var(provider_name, "BASE_URL")
+        ))
+    })
 }
 
 fn resolve_provider_access_token(
@@ -586,7 +653,7 @@ fn parse_auth_file_value(value: &serde_json::Value, path: &Path) -> Result<Optio
     }
 
     let mut providers = HashMap::new();
-    for provider_name in ["openai", "openrouter"] {
+    for provider_name in ["openai", "openrouter", "local"] {
         let node = object.get(provider_name).unwrap_or(value);
         if let Some(auth) = parse_provider_auth_value(provider_name, node, path)? {
             providers.insert(provider_name.to_string(), auth);
@@ -795,6 +862,56 @@ mod tests {
     }
 
     #[test]
+    fn local_provider_requires_base_url() {
+        let providers = build_configured_providers(
+            &config_with_provider("local", ProviderConfig::default()),
+            ".",
+        )
+        .expect("providers");
+
+        assert!(!providers.contains_key("local"));
+    }
+
+    #[test]
+    fn local_provider_uses_base_url_without_auth_header_when_no_key_configured() {
+        let providers = build_configured_providers(
+            &config_with_provider(
+                "local",
+                ProviderConfig {
+                    base_url: Some("http://127.0.0.1:1234/v1".to_string()),
+                    default_model: Some("qwen2.5-coder-7b-instruct".to_string()),
+                    ..ProviderConfig::default()
+                },
+            ),
+            ".",
+        )
+        .expect("providers");
+
+        let provider = providers.get("local").expect("local provider");
+        let request = provider
+            .build_http_request(&ChatRequest::new(
+                "qwen2.5-coder-7b-instruct",
+                vec![Message::user("hi")],
+            ))
+            .expect("request");
+
+        assert_eq!(request.url, "http://127.0.0.1:1234/v1/chat/completions");
+        assert!(
+            !request
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("Authorization"))
+        );
+    }
+
+    #[test]
+    fn local_provider_default_model_must_be_configured() {
+        let err = resolve_default_model("local", &ZagentConfig::default())
+            .expect_err("local default model should require configuration");
+        assert!(err.to_string().contains("providers.local.default_model"));
+    }
+
+    #[test]
     fn split_provider_model_uses_colon_prefix() {
         assert_eq!(
             split_provider_model("openai:gpt-5.2"),
@@ -940,6 +1057,41 @@ mod tests {
                 .any(|(k, v)| k == "ChatGPT-Account-Id" && v == "acct_123")
         );
 
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn local_provider_reads_provider_keyed_auth_json() {
+        let temp_dir = std::env::temp_dir().join(format!("zagent-auth-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("temp dir");
+        std::fs::write(
+            temp_dir.join("auth.json"),
+            r#"{"providers":{"local":{"api_key":"local-test"}}}"#,
+        )
+        .expect("auth.json");
+
+        let providers = build_configured_providers(
+            &config_with_provider(
+                "local",
+                ProviderConfig {
+                    base_url: Some("http://127.0.0.1:1234/v1".to_string()),
+                    ..ProviderConfig::default()
+                },
+            ),
+            temp_dir.to_string_lossy().as_ref(),
+        )
+        .expect("providers");
+
+        let provider = providers.get("local").expect("local provider");
+        let request = provider
+            .build_http_request(&ChatRequest::new("model", vec![Message::user("hi")]))
+            .expect("request");
+        assert!(
+            request
+                .headers
+                .iter()
+                .any(|(k, v)| k == "Authorization" && v == "Bearer local-test")
+        );
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 

@@ -19,7 +19,7 @@ A Codex CLI alternative built in Rust, focused on **multi-LLM provider support**
 ### Prerequisites
 
 - Rust 1.85+ (2024 edition)
-- Either an [OpenRouter](https://openrouter.ai/) API key or OpenAI credentials
+- Either an [OpenRouter](https://openrouter.ai/) API key, OpenAI credentials, or a local OpenAI-compatible server such as LM Studio or llama.cpp
 
 ### Installation
 
@@ -98,6 +98,7 @@ cargo run -p zagent-native -- -m minimax/minimax-m2.5 -p "Write unit tests for s
 ```bash
 cargo run -p zagent-native -- -m openai:gpt-5.2 -p "Refactor this Rust module"
 cargo run -p zagent-native -- -m openrouter:anthropic/claude-sonnet-4 -p "Summarize the repo"
+cargo run -p zagent-native -- -m local:qwen2.5-coder-7b-instruct -p "Add tests for this crate"
 ```
 
 #### Backend + Frontends
@@ -513,6 +514,8 @@ The architecture is designed for **single-server, single-active-session** operat
 |----------|----------|-------------|
 | `OPENROUTER_API_KEY` | No | Your OpenRouter API key |
 | `OPENAI_API_KEY` | No | Your OpenAI API key for `openai` provider API-key auth |
+| `ZAGENT_PROVIDER_LOCAL_BASE_URL` | No | Base URL for a local OpenAI-compatible server, for example `http://127.0.0.1:1234/v1` |
+| `ZAGENT_PROVIDER_LOCAL_API_KEY` | No | Optional API key for a local OpenAI-compatible server |
 | `ZAGENT_PROVIDER_OPENAI_AUTH_METHOD` | No | `api_key` or `chatgpt_subscription` |
 | `ZAGENT_PROVIDER_OPENAI_ACCESS_TOKEN` | No | Existing ChatGPT bearer access token for subscription auth |
 | `ZAGENT_PROVIDER_OPENAI_ACCOUNT_ID` | No | ChatGPT account/workspace id for subscription auth |
@@ -559,6 +562,20 @@ cargo run -p zagent-server -- auth openai
 The server and native CLI load `.env` and `.env-auth` automatically on startup.
 
 This first pass stores the current access token plus account/workspace id. It does not implement refresh-token reuse on startup, so you may need to rerun the auth command when the token expires.
+
+`zagent-config.yaml` using a local OpenAI-compatible server (LM Studio, llama.cpp server mode, etc.):
+
+```yaml
+default_provider: local
+providers:
+  local:
+    base_url: http://127.0.0.1:1234/v1
+    # Optional when your local server requires Bearer auth
+    api_key_env: ZAGENT_PROVIDER_LOCAL_API_KEY
+    default_model: qwen2.5-coder-7b-instruct
+```
+
+For local providers, zAgent does not invent a default model. Configure `providers.local.default_model` or `ZAGENT_PROVIDER_LOCAL_DEFAULT_MODEL` to match a model your server actually exposes from `/models`. Use `local:model-name` when selecting it explicitly on the CLI.
 
 ## Adding a New Provider
 

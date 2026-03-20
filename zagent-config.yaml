@@ -1,5 +1,5 @@
-default_provider: openai
-default_model: gpt-5.4
+default_provider: local
+default_model: google/gemma-3-4b
 
 providers:
   openrouter:
@@ -15,6 +15,10 @@ providers:
     access_token_env: ZAGENT_PROVIDER_OPENAI_ACCESS_TOKEN
     account_id_env: ZAGENT_PROVIDER_OPENAI_ACCOUNT_ID
     default_model: gpt-5.4
+  local:
+    enabled: true
+    base_url: http://192.168.68.53:1234/v1
+    default_model: google/gemma-3-4b
 
 mcp_servers:
   playwright:
