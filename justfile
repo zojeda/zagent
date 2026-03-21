@@ -4,7 +4,17 @@ export CARGO := "cargo"
 export TRUNK := "trunk"
 export RUSTUP := "rustup"
 export BACKEND_PORT := "8787"
-export BACKEND_URL := "http://127.0.0.1:{{BACKEND_PORT}}"
+export BACKEND_URL := "http://127.0.0.1:8787"
+export SURREALDB_HOST := "127.0.0.1"
+export SURREALDB_PORT := "8000"
+export SURREALDB_URL := "ws://127.0.0.1:8000"
+export SURREALDB_USER := "root"
+export SURREALDB_PASS := "root"
+export SURREALDB_NS := "zagent"
+export SURREALDB_DB := "session_storage"
+export SURREALDB_CONTAINER := "zagent-surrealdb-dev"
+export DIOXUS := "dx"
+export DIOXUS_WEB_PORT := "8080"
 
 alias run-native-repl := run-native
 
@@ -102,6 +112,73 @@ run-web-dev:
 [group('Web')]
 run-web-manual:
     cd crates/zagent-web && $TRUNK serve --proxy-backend "$BACKEND_URL/api" --proxy-rewrite /api
+
+# Run SurrealDB, zagent-server, and the Dioxus web app together for local development.
+[group('Web')]
+[parallel]
+run-dioxus-dev: run-dioxus-db run-dioxus-server run-dioxus-web
+
+[private]
+run-dioxus-db:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    surrealdb_url="ws://$SURREALDB_HOST:$SURREALDB_PORT"
+    echo "Starting SurrealDB on $surrealdb_url"
+
+    if command -v surreal >/dev/null 2>&1; then
+        exec surreal start \
+            --bind "$SURREALDB_HOST:$SURREALDB_PORT" \
+            --user "$SURREALDB_USER" \
+            --pass "$SURREALDB_PASS" \
+            memory
+    fi
+
+    if command -v docker >/dev/null 2>&1; then
+        docker rm -f "$SURREALDB_CONTAINER" >/dev/null 2>&1 || true
+        trap 'docker rm -f "$SURREALDB_CONTAINER" >/dev/null 2>&1 || true' EXIT INT TERM
+        exec docker run --rm \
+            --name "$SURREALDB_CONTAINER" \
+            -p "$SURREALDB_HOST:$SURREALDB_PORT:8000" \
+            surrealdb/surrealdb:latest \
+            start \
+            --bind "0.0.0.0:8000" \
+            --user "$SURREALDB_USER" \
+            --pass "$SURREALDB_PASS" \
+            memory
+    fi
+
+    echo "SurrealDB requires either the 'surreal' CLI or Docker"
+    exit 1
+
+[private]
+run-dioxus-server:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    surrealdb_url="ws://$SURREALDB_HOST:$SURREALDB_PORT"
+    backend_url="http://127.0.0.1:$BACKEND_PORT"
+
+    for _ in {1..50}; do
+        if (echo >/dev/tcp/"$SURREALDB_HOST"/"$SURREALDB_PORT") >/dev/null 2>&1; then
+            echo "Starting zagent-server on $backend_url"
+            exec env SURREALDB_URL="$surrealdb_url" $CARGO run -p zagent-server -- --port "$BACKEND_PORT"
+        fi
+        sleep 0.2
+    done
+
+    echo "SurrealDB did not become ready on $surrealdb_url"
+    exit 1
+
+[private]
+run-dioxus-web:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    command -v "$DIOXUS" >/dev/null 2>&1 || { echo "$DIOXUS is required"; exit 1; }
+    echo "Starting Dioxus web app with $DIOXUS serve"
+    cd crates/zagent-dioxus
+    exec "$DIOXUS" serve --platform web --package web --port "$DIOXUS_WEB_PORT" --open false
 
 # Print the newest log file.
 [group('Logs')]

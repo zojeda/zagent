@@ -1,5 +1,5 @@
 default_provider: local
-default_model: google/gemma-3-4b
+default_model: qwen/qwen3.5-35b-a3b
 
 providers:
   openrouter:
@@ -18,7 +18,7 @@ providers:
   local:
     enabled: true
     base_url: http://192.168.68.53:1234/v1
-    default_model: google/gemma-3-4b
+    default_model: qwen/qwen3.5-35b-a3b
 
 mcp_servers:
   playwright:
