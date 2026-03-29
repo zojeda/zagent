@@ -1,22 +1,19 @@
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::fs;
 
 use zagent_core::Result;
 use zagent_core::tools::Tool;
 
-/// Apply a unified diff to an existing file.
-pub struct FileEditTool;
+use crate::fs::SharedFileSystem;
 
-impl Default for FileEditTool {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Apply a unified diff to an existing file.
+pub struct FileEditTool {
+    file_system: SharedFileSystem,
 }
 
 impl FileEditTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(file_system: SharedFileSystem) -> Self {
+        Self { file_system }
     }
 }
 
@@ -58,15 +55,18 @@ impl Tool for FileEditTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| zagent_core::Error::tool("file_edit", "Missing 'diff' parameter"))?;
 
-        let original = fs::read_to_string(path).await.map_err(|e| {
+        let original = self.file_system.read_to_string(path).await.map_err(|e| {
             zagent_core::Error::tool("file_edit", format!("Failed to read '{path}': {e}"))
         })?;
 
         let updated = apply_unified_diff(&original, diff)?;
 
-        fs::write(path, &updated).await.map_err(|e| {
-            zagent_core::Error::tool("file_edit", format!("Failed to write '{path}': {e}"))
-        })?;
+        self.file_system
+            .write_string(path, &updated)
+            .await
+            .map_err(|e| {
+                zagent_core::Error::tool("file_edit", format!("Failed to write '{path}': {e}"))
+            })?;
 
         Ok(format!(
             "Successfully applied diff to {path} ({} -> {} bytes)",

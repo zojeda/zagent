@@ -41,6 +41,37 @@
   overflow-x: auto;
 }
 
+.markdown-body .mermaid-graph {
+  background: #f6f8fa;
+  border: 1px solid #e1e8e3;
+  border-radius: 8px;
+  padding: 0.5rem;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  font-family: "IBM Plex Mono", "Cascadia Mono", monospace;
+}
+
+.markdown-body .mermaid-graph[data-mermaid-rendered="true"] {
+  background: #ffffff;
+  font-family: inherit;
+}
+
+.markdown-body .mermaid-graph[data-mermaid-rendered="error"]::before {
+  content: "Mermaid render error: " attr(data-mermaid-error);
+  display: block;
+  margin-bottom: 0.4rem;
+  color: #a34f29;
+  font-weight: 600;
+  white-space: pre-wrap;
+}
+
+.markdown-body .mermaid-graph svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+}
+
 .markdown-body code {
   font-family: "IBM Plex Mono", "Cascadia Mono", monospace;
 }

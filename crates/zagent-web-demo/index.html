@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>zAgent Wasm Demo</title>
+    <link data-trunk rel="rust" />
+    <style>
+      :root {
+        --bg: #f3efe4;
+        --panel: rgba(255, 252, 244, 0.88);
+        --ink: #1e2b2d;
+        --muted: #5d6d68;
+        --accent: #0b6e4f;
+        --accent-strong: #084c39;
+        --line: rgba(30, 43, 45, 0.12);
+        --shadow: 0 24px 60px rgba(30, 43, 45, 0.12);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at top left, rgba(11, 110, 79, 0.18), transparent 30%),
+          radial-gradient(circle at bottom right, rgba(190, 120, 40, 0.16), transparent 28%),
+          linear-gradient(135deg, #f6f3ea 0%, #ece6d8 100%);
+        font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, serif;
+      }
+
+      main {
+        width: min(1180px, calc(100vw - 32px));
+        margin: 32px auto;
+        display: grid;
+        gap: 20px;
+      }
+
+      .hero,
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 24px;
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(10px);
+      }
+
+      .hero {
+        padding: 28px 28px 24px;
+      }
+
+      .eyebrow {
+        margin: 0 0 10px;
+        color: var(--accent);
+        font-size: 0.82rem;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(2rem, 4vw, 3.4rem);
+        line-height: 0.95;
+        max-width: 12ch;
+      }
+
+      .hero p {
+        margin: 16px 0 0;
+        max-width: 70ch;
+        color: var(--muted);
+        font-size: 1.04rem;
+      }
+
+      .grid {
+        display: grid;
+        gap: 20px;
+        grid-template-columns: 1.1fr 0.9fr;
+      }
+
+      .panel {
+        padding: 22px;
+      }
+
+      .panel h2 {
+        margin: 0 0 12px;
+        font-size: 1.05rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .hint {
+        margin: 0 0 14px;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+
+      textarea {
+        width: 100%;
+        min-height: 180px;
+        resize: vertical;
+        border: 1px solid rgba(30, 43, 45, 0.14);
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.72);
+        color: var(--ink);
+        padding: 14px 16px;
+        font: 0.95rem/1.55 "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      }
+
+      #prompt {
+        min-height: 104px;
+      }
+
+      .actions {
+        display: flex;
+        gap: 12px;
+        margin-top: 16px;
+        flex-wrap: wrap;
+      }
+
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 12px 18px;
+        cursor: pointer;
+        font: 600 0.95rem/1.1 system-ui, sans-serif;
+      }
+
+      #run {
+        background: var(--accent);
+        color: white;
+      }
+
+      #run:hover {
+        background: var(--accent-strong);
+      }
+
+      #reset {
+        background: rgba(30, 43, 45, 0.08);
+        color: var(--ink);
+      }
+
+      #status {
+        margin-top: 12px;
+        min-height: 1.4rem;
+        color: var(--muted);
+        font: 0.92rem/1.4 system-ui, sans-serif;
+      }
+
+      .status-error {
+        color: #9f2f2f;
+      }
+
+      .status-ok {
+        color: var(--accent-strong);
+      }
+
+      pre {
+        margin: 0;
+        min-height: 260px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        border-radius: 18px;
+        padding: 18px;
+        background: #172224;
+        color: #eaf4ef;
+        font: 0.95rem/1.6 "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      }
+
+      .meta {
+        margin-top: 12px;
+        color: var(--muted);
+        font: 0.92rem/1.5 system-ui, sans-serif;
+      }
+
+      @media (max-width: 900px) {
+        main {
+          width: min(100vw - 20px, 100%);
+          margin: 10px auto 24px;
+        }
+
+        .grid {
+          grid-template-columns: 1fr;
+        }
+
+        .hero,
+        .panel {
+          border-radius: 20px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="hero">
+        <p class="eyebrow">Embedded Wasm Agent</p>
+        <h1>Browser-run zAgent with a client-owned VFS</h1>
+        <p>
+          This page runs the embedded agent inside WebAssembly. The visible workspace
+          comes entirely from the JSON virtual filesystem below, so the client controls
+          exactly what the agent and file tools can inspect.
+        </p>
+      </section>
+
+      <section class="grid">
+        <div class="panel">
+          <h2>Provider</h2>
+          <p class="hint">This version can call a real LLM endpoint from the browser. Use demo keys only in trusted local testing.</p>
+          <div class="actions" style="margin-top: 0;">
+            <label style="flex: 1 1 180px;">
+              <div class="hint" style="margin-bottom: 6px;">Provider</div>
+              <select id="provider" style="width: 100%; min-height: 46px; border-radius: 16px; border: 1px solid rgba(30, 43, 45, 0.14); background: rgba(255, 255, 255, 0.72); color: var(--ink); padding: 0 14px; font: 0.95rem/1.3 system-ui, sans-serif;">
+                <option value="openrouter">OpenRouter</option>
+                <option value="openai">OpenAI</option>
+                <option value="local">Local OpenAI-Compatible</option>
+              </select>
+            </label>
+            <label style="flex: 2 1 240px;">
+              <div class="hint" style="margin-bottom: 6px;">Model</div>
+              <input id="model" type="text" style="width: 100%; min-height: 46px; border-radius: 16px; border: 1px solid rgba(30, 43, 45, 0.14); background: rgba(255, 255, 255, 0.72); color: var(--ink); padding: 0 14px; font: 0.95rem/1.3 system-ui, sans-serif;" />
+            </label>
+          </div>
+          <div class="actions" style="margin-top: 12px;">
+            <label style="flex: 2 1 320px;">
+              <div class="hint" style="margin-bottom: 6px;">Base URL</div>
+              <input id="base-url" type="text" style="width: 100%; min-height: 46px; border-radius: 16px; border: 1px solid rgba(30, 43, 45, 0.14); background: rgba(255, 255, 255, 0.72); color: var(--ink); padding: 0 14px; font: 0.95rem/1.3 system-ui, sans-serif;" />
+            </label>
+            <label style="flex: 2 1 320px;">
+              <div class="hint" style="margin-bottom: 6px;">API Key</div>
+              <input id="api-key" type="password" style="width: 100%; min-height: 46px; border-radius: 16px; border: 1px solid rgba(30, 43, 45, 0.14); background: rgba(255, 255, 255, 0.72); color: var(--ink); padding: 0 14px; font: 0.95rem/1.3 system-ui, sans-serif;" />
+            </label>
+          </div>
+
+          <h2>Workspace VFS</h2>
+          <p class="hint">Edit the JSON map of visible files, then ask the agent to inspect them.</p>
+          <textarea id="vfs"></textarea>
+
+          <h2 style="margin-top: 18px;">Prompt</h2>
+          <p class="hint">The demo provider is scripted to use `file_read` before it answers.</p>
+          <textarea id="prompt"></textarea>
+
+          <div class="actions">
+            <button id="run">Run Agent</button>
+            <button id="reset">Reset Demo</button>
+          </div>
+          <div id="status"></div>
+        </div>
+
+        <div class="panel">
+          <h2>Agent Output</h2>
+          <pre id="output">Press “Run Agent” to start the demo.</pre>
+          <div class="meta" id="meta">No agent run yet.</div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Tool Debug</h2>
+        <p class="hint">Live agent progress rendered from embedded progress events.</p>
+        <pre id="debug">No tool calls yet.</pre>
+      </section>
+    </main>
+  </body>
+</html>

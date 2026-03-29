@@ -1,25 +1,34 @@
-pub mod file_edit;
-pub mod file_read;
-pub mod file_write;
-pub mod list_dir;
 pub mod mcp;
 pub mod shell_exec;
 pub mod webfetch;
 pub mod websearch;
 
+use std::sync::Arc;
+
 use zagent_core::tools::ToolRegistry;
+use zagent_loop::register_file_tools;
+
+use crate::fs::{RootedHostFileSystem, SharedFileSystem};
 
 pub async fn register_all_tools(
+    working_dir: &str,
+    mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
+) -> ToolRegistry {
+    let file_system: SharedFileSystem = Arc::new(
+        RootedHostFileSystem::new(working_dir).expect("working directory should be a valid root"),
+    );
+    register_all_tools_with_filesystem(file_system, working_dir, mcp_manager).await
+}
+
+pub async fn register_all_tools_with_filesystem(
+    file_system: SharedFileSystem,
     working_dir: &str,
     mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
 
     registry.register(Box::new(shell_exec::ShellExecTool::new(working_dir)));
-    registry.register(Box::new(file_edit::FileEditTool::new()));
-    registry.register(Box::new(file_read::FileReadTool::new()));
-    registry.register(Box::new(file_write::FileWriteTool::new()));
-    registry.register(Box::new(list_dir::ListDirTool::new()));
+    register_file_tools(&mut registry, file_system);
     registry.register(Box::new(websearch::WebSearchTool::new()));
     registry.register(Box::new(webfetch::WebFetchTool::new()));
     if let Some(manager) = mcp_manager {
@@ -34,13 +43,17 @@ pub async fn register_all_tools(
 /// Tool registry for WASI mode.
 ///
 /// This intentionally excludes host shell execution to keep the runtime constrained.
-pub fn register_wasi_tools() -> ToolRegistry {
+pub fn register_wasi_tools(working_dir: &str) -> ToolRegistry {
+    let file_system: SharedFileSystem = Arc::new(
+        RootedHostFileSystem::new(working_dir).expect("working directory should be a valid root"),
+    );
+    register_wasi_tools_with_filesystem(file_system)
+}
+
+pub fn register_wasi_tools_with_filesystem(file_system: SharedFileSystem) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
 
-    registry.register(Box::new(file_edit::FileEditTool::new()));
-    registry.register(Box::new(file_read::FileReadTool::new()));
-    registry.register(Box::new(file_write::FileWriteTool::new()));
-    registry.register(Box::new(list_dir::ListDirTool::new()));
+    register_file_tools(&mut registry, file_system);
     registry.register(Box::new(websearch::WebSearchTool::new()));
     registry.register(Box::new(webfetch::WebFetchTool::new()));
 

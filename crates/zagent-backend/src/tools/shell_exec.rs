@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::process::Stdio;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+use crate::shell_stream::{self, ShellStreamChunk};
 use zagent_core::Result;
 use zagent_core::tools::Tool;
 
@@ -68,28 +70,77 @@ impl Tool for ShellExecTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(60);
 
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(working_dir)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output(),
-        )
-        .await
-        .map_err(|_| {
-            zagent_core::Error::tool(
+        let stream_id = args
+            .get("_zagent_tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("shell_exec");
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(working_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| zagent_core::Error::tool("shell_exec", format!("Failed to spawn: {e}")))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| zagent_core::Error::tool("shell_exec", "Failed to capture stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| zagent_core::Error::tool("shell_exec", "Failed to capture stderr"))?;
+
+        let stdout_stream_id = stream_id.to_string();
+        let stderr_stream_id = stream_id.to_string();
+        let stdout_task =
+            tokio::spawn(
+                async move { read_shell_stream(stdout, stdout_stream_id, "stdout").await },
+            );
+        let stderr_task =
+            tokio::spawn(
+                async move { read_shell_stream(stderr, stderr_stream_id, "stderr").await },
+            );
+
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
+        tokio::pin!(timeout);
+
+        let (status, timed_out) = tokio::select! {
+            status = child.wait() => (
+                status.map_err(|e| zagent_core::Error::tool("shell_exec", format!("Failed waiting for command: {e}")))?,
+                false,
+            ),
+            _ = &mut timeout => {
+                let _ = child.kill().await;
+                let status = child.wait().await.map_err(|e| {
+                    zagent_core::Error::tool("shell_exec", format!("Failed waiting for timed out command: {e}"))
+                })?;
+                (status, true)
+            }
+        };
+
+        let stdout = stdout_task.await.map_err(|e| {
+            zagent_core::Error::tool("shell_exec", format!("stdout task failed: {e}"))
+        })??;
+        let stderr = stderr_task.await.map_err(|e| {
+            zagent_core::Error::tool("shell_exec", format!("stderr task failed: {e}"))
+        })??;
+
+        if timed_out {
+            shell_stream::publish(ShellStreamChunk {
+                stream_id: stream_id.to_string(),
+                channel: "system".to_string(),
+                text: format!("Command timed out after {timeout_secs}s\n"),
+            });
+            return Err(zagent_core::Error::tool(
                 "shell_exec",
                 format!("Command timed out after {timeout_secs}s: {command}"),
-            )
-        })?
-        .map_err(|e| zagent_core::Error::tool("shell_exec", format!("Failed to spawn: {e}")))?;
+            ));
+        }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let exit_code = output.status.code().unwrap_or(-1);
+        let exit_code = status.code().unwrap_or(-1);
 
         let mut result = String::new();
         result.push_str(&format!("Exit code: {exit_code}\n"));
@@ -106,4 +157,34 @@ impl Tool for ShellExecTool {
 
         Ok(result)
     }
+}
+
+async fn read_shell_stream<R>(
+    mut reader: R,
+    stream_id: String,
+    channel: &'static str,
+) -> Result<String>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut output = String::new();
+    let mut buf = [0u8; 2048];
+
+    loop {
+        let read = reader.read(&mut buf).await.map_err(|e| {
+            zagent_core::Error::tool("shell_exec", format!("Failed reading {channel}: {e}"))
+        })?;
+        if read == 0 {
+            break;
+        }
+        let text = String::from_utf8_lossy(&buf[..read]).to_string();
+        output.push_str(&text);
+        shell_stream::publish(ShellStreamChunk {
+            stream_id: stream_id.clone(),
+            channel: channel.to_string(),
+            text,
+        });
+    }
+
+    Ok(output)
 }

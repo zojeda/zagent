@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 
+use crate::fs::AgentFileSystem;
 use crate::provider::types::ToolDefinition;
 use regex::Regex;
 use serde::Deserialize;
@@ -137,97 +138,156 @@ pub(crate) fn collect_custom_agents(
             continue;
         };
 
-        let Ok(bytes) = fs::read(&path) else {
+        let Ok(content) = read_custom_agent_file_from_host(&path) else {
             continue;
         };
-        let clipped = if bytes.len() > MAX_CUSTOM_AGENT_FILE_BYTES {
-            &bytes[..MAX_CUSTOM_AGENT_FILE_BYTES]
-        } else {
-            &bytes
-        };
-        let mut content = String::from_utf8_lossy(clipped).to_string();
-        if bytes.len() > MAX_CUSTOM_AGENT_FILE_BYTES {
-            content.push_str(&format!(
-                "\n\n[truncated at {} bytes]",
-                MAX_CUSTOM_AGENT_FILE_BYTES
-            ));
-        }
-
-        let (manifest, body) = parse_frontmatter(&content);
-        if manifest.id.is_some() {
-            continue;
-        }
-        let name = manifest.name.unwrap_or_else(|| base_name.to_string());
-        let id = sanitize_custom_agent_id(&name);
-        if id.is_empty() {
-            continue;
-        }
-        let description = manifest
-            .description
-            .unwrap_or_else(|| format!("Specialized child agent for {}", name));
-        let model = manifest
-            .model
-            .as_ref()
-            .filter(|m| !m.trim().is_empty())
-            .cloned()
-            .unwrap_or_else(|| default_model.to_string());
-        let tools = manifest
-            .tools
-            .iter()
-            .filter_map(|t| {
-                let trimmed = t.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            })
-            .collect::<Vec<_>>();
-        let handoffs = manifest
-            .handoffs
-            .iter()
-            .filter_map(|h| {
-                let agent = h.agent.as_deref().map(str::trim).unwrap_or_default();
-                if agent.is_empty() {
-                    return None;
-                }
-                Some(CustomAgentHandoffDefinition {
-                    label: h
-                        .label
-                        .as_deref()
-                        .filter(|v| !v.trim().is_empty())
-                        .unwrap_or("handoff")
-                        .trim()
-                        .to_string(),
-                    agent: agent.to_string(),
-                    prompt: h.prompt.clone().filter(|v| !v.trim().is_empty()),
-                    send: h.send,
-                    model: h.model.clone().filter(|v| !v.trim().is_empty()),
-                })
-            })
-            .collect::<Vec<_>>();
-        let instructions = body.trim().to_string();
-        if instructions.is_empty() {
-            continue;
-        }
         let relative = path
             .strip_prefix(&cwd)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| path.to_string_lossy().to_string());
 
-        out.push(CustomAgentDefinition {
-            tool_name: format!("handoff_{id}"),
-            id,
-            name,
-            description,
-            model,
-            user_invokable: manifest.user_invokable,
-            invoke_default: manifest.user_invokable && manifest.invoke_default,
-            tools,
-            handoffs,
-            instructions,
-            relative_path_from_cwd: relative,
-        });
+        if let Some(agent) =
+            parse_custom_agent_definition(&relative, base_name, &content, default_model)
+        {
+            out.push(agent);
+        }
+    }
+
+    out.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
+    out.truncate(MAX_CUSTOM_AGENTS);
+    out
+}
+
+fn parse_custom_agent_definition(
+    relative_path_from_cwd: &str,
+    base_name: String,
+    content: &str,
+    default_model: &str,
+) -> Option<CustomAgentDefinition> {
+    let (manifest, body) = parse_frontmatter(content);
+    if manifest.id.is_some() {
+        return None;
+    }
+    let name = manifest.name.unwrap_or(base_name);
+    let id = sanitize_custom_agent_id(&name);
+    if id.is_empty() {
+        return None;
+    }
+    let description = manifest
+        .description
+        .unwrap_or_else(|| format!("Specialized child agent for {}", name));
+    let model = manifest
+        .model
+        .as_ref()
+        .filter(|m| !m.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| default_model.to_string());
+    let tools = manifest
+        .tools
+        .iter()
+        .filter_map(|t| {
+            let trimmed = t.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .collect::<Vec<_>>();
+    let handoffs = manifest
+        .handoffs
+        .iter()
+        .filter_map(|h| {
+            let agent = h.agent.as_deref().map(str::trim).unwrap_or_default();
+            if agent.is_empty() {
+                return None;
+            }
+            Some(CustomAgentHandoffDefinition {
+                label: h
+                    .label
+                    .as_deref()
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or("handoff")
+                    .trim()
+                    .to_string(),
+                agent: agent.to_string(),
+                prompt: h.prompt.clone().filter(|v| !v.trim().is_empty()),
+                send: h.send,
+                model: h.model.clone().filter(|v| !v.trim().is_empty()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let instructions = body.trim().to_string();
+    if instructions.is_empty() {
+        return None;
+    }
+
+    Some(CustomAgentDefinition {
+        tool_name: format!("handoff_{id}"),
+        id,
+        name,
+        description,
+        model,
+        user_invokable: manifest.user_invokable,
+        invoke_default: manifest.user_invokable && manifest.invoke_default,
+        tools,
+        handoffs,
+        instructions,
+        relative_path_from_cwd: relative_path_from_cwd.to_string(),
+    })
+}
+
+fn read_custom_agent_file_from_host(path: &std::path::Path) -> std::io::Result<String> {
+    let bytes = fs::read(path)?;
+    Ok(clip_custom_agent_bytes(&bytes))
+}
+
+async fn read_custom_agent_file(file_system: &dyn AgentFileSystem, path: &str) -> Option<String> {
+    let content = file_system.read_to_string(path).await.ok()?;
+    Some(clip_custom_agent_bytes(content.as_bytes()))
+}
+
+fn clip_custom_agent_bytes(bytes: &[u8]) -> String {
+    let clipped = if bytes.len() > MAX_CUSTOM_AGENT_FILE_BYTES {
+        &bytes[..MAX_CUSTOM_AGENT_FILE_BYTES]
+    } else {
+        bytes
+    };
+    let mut content = String::from_utf8_lossy(clipped).to_string();
+    if bytes.len() > MAX_CUSTOM_AGENT_FILE_BYTES {
+        content.push_str(&format!(
+            "\n\n[truncated at {} bytes]",
+            MAX_CUSTOM_AGENT_FILE_BYTES
+        ));
+    }
+    content
+}
+
+pub(crate) async fn collect_custom_agents_from_fs(
+    file_system: &dyn AgentFileSystem,
+    default_model: &str,
+) -> Vec<CustomAgentDefinition> {
+    let Ok(mut entries) = file_system.list_dir(CUSTOM_AGENTS_DIR, false, 1).await else {
+        return Vec::new();
+    };
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut out = Vec::new();
+    for entry in entries {
+        if out.len() >= MAX_CUSTOM_AGENTS || entry.is_dir || !entry.name.ends_with(".md") {
+            continue;
+        }
+        let Some(base_name) = custom_agent_base_name(&entry.name) else {
+            continue;
+        };
+        let Some(content) = read_custom_agent_file(file_system, &entry.path).await else {
+            continue;
+        };
+        if let Some(agent) =
+            parse_custom_agent_definition(&entry.path, base_name, &content, default_model)
+        {
+            out.push(agent);
+        }
     }
 
     out.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));

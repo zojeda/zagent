@@ -94,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session_store,
         model: cli.model,
         system_prompt: cli.system,
+        context_management_policy: None,
         working_dir,
         session_dir: cli.session_dir,
         resume_session: cli.session,

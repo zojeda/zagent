@@ -1,22 +1,19 @@
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::fs;
 
 use zagent_core::Result;
 use zagent_core::tools::Tool;
 
-/// Read file contents, optionally with line range.
-pub struct FileReadTool;
+use crate::fs::SharedFileSystem;
 
-impl Default for FileReadTool {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Read file contents, optionally with line range.
+pub struct FileReadTool {
+    file_system: SharedFileSystem,
 }
 
 impl FileReadTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(file_system: SharedFileSystem) -> Self {
+        Self { file_system }
     }
 }
 
@@ -59,7 +56,7 @@ impl Tool for FileReadTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| zagent_core::Error::tool("file_read", "Missing 'path' parameter"))?;
 
-        let content = fs::read_to_string(path).await.map_err(|e| {
+        let content = self.file_system.read_to_string(path).await.map_err(|e| {
             zagent_core::Error::tool("file_read", format!("Failed to read '{path}': {e}"))
         })?;
 

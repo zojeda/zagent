@@ -161,6 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.model = resolve_default_model(&provider_name, &app_config)?;
     }
     config.max_turns = cli.max_turns;
+    config.context_management_policy = app_config.resolved_context_management_policy();
     if let Some(ref system) = cli.system {
         config.system_prompt = system.clone();
     }
@@ -251,6 +252,7 @@ async fn run_single_prompt(
         http_client,
         providers,
         tools,
+        None,
         session,
         Some(session_store),
         config,
@@ -331,6 +333,7 @@ async fn run_repl(
                     http_client,
                     providers,
                     tools,
+                    None,
                     session,
                     Some(session_store),
                     config,

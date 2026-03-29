@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::provider::types::Message;
+use crate::time::utc_now;
 
 /// Metadata about a session (for listing)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +71,8 @@ pub struct SessionEvent {
     #[serde(default)]
     pub tool_name: Option<String>,
     #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
     pub success: Option<bool>,
     #[serde(default)]
     pub finish_reason: Option<String>,
@@ -121,6 +124,7 @@ impl SessionEvent {
             model: None,
             model_ref: None,
             tool_name: None,
+            tool_call_id: None,
             success: None,
             finish_reason: None,
             latency_ms: None,
@@ -133,7 +137,7 @@ impl SessionEvent {
             arguments: None,
             result: None,
             payload,
-            created_at: Utc::now(),
+            created_at: utc_now(),
         }
     }
 }
@@ -146,7 +150,7 @@ impl SessionState {
         system_prompt: impl Into<String>,
         working_dir: impl Into<String>,
     ) -> Self {
-        let now = Utc::now();
+        let now = utc_now();
         let id = Uuid::new_v4().to_string();
         Self {
             meta: SessionMeta {
@@ -169,7 +173,7 @@ impl SessionState {
 
     pub fn add_message(&mut self, message: Message) {
         self.meta.message_count += 1;
-        self.meta.updated_at = Utc::now();
+        self.meta.updated_at = utc_now();
         self.messages.push(message);
     }
 
@@ -180,7 +184,7 @@ impl SessionState {
     pub fn update_token_usage(&mut self, prompt_tokens: u64, completion_tokens: u64) {
         self.meta.total_prompt_tokens += prompt_tokens;
         self.meta.total_completion_tokens += completion_tokens;
-        self.meta.updated_at = Utc::now();
+        self.meta.updated_at = utc_now();
     }
 }
 

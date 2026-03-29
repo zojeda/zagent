@@ -7,6 +7,7 @@ const FOOTER_TOTALS_CSS: Asset = asset!("/assets/styling/widgets/footer_totals.c
 const PROMPT_INPUT_CSS: Asset = asset!("/assets/styling/widgets/prompt_input.css");
 const MARKDOWN_CARD_CSS: Asset = asset!("/assets/styling/widgets/markdown_card.css");
 const CHAT_TIMELINE_CSS: Asset = asset!("/assets/styling/widgets/chat_timeline.css");
+const TERMINAL_STREAM_CSS: Asset = asset!("/assets/styling/widgets/terminal_stream.css");
 
 #[component]
 pub fn UiWidgetStyles() -> Element {
@@ -18,5 +19,6 @@ pub fn UiWidgetStyles() -> Element {
         document::Stylesheet { href: PROMPT_INPUT_CSS }
         document::Stylesheet { href: MARKDOWN_CARD_CSS }
         document::Stylesheet { href: CHAT_TIMELINE_CSS }
+        document::Stylesheet { href: TERMINAL_STREAM_CSS }
     }
 }

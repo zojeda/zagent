@@ -3,7 +3,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
-use tracing::warn;
+use tracing::{info, warn};
 
 use surrealdb::Surreal;
 use surrealdb::engine::any::{Any, connect};
@@ -67,11 +67,7 @@ impl SurrealSessionStore {
         })?;
 
         let migrator = Migrator::new(&db);
-        // Always initialize migration metadata; optionally apply latest.
-        let _ = migrator.status().await?;
-        if auto_migrate_latest {
-            migrator.migrate_to_latest().await?;
-        }
+        ensure_database_ready(&migrator, auto_migrate_latest).await?;
         let store = Self { db };
         store.migrate_legacy_sessions().await?;
         store.migrate_legacy_events().await?;
@@ -259,6 +255,44 @@ impl SurrealSessionStore {
 
         Ok(None)
     }
+}
+
+async fn ensure_database_ready(migrator: &Migrator<'_>, auto_migrate_latest: bool) -> Result<()> {
+    let current = migrator.current_version().await?;
+    let latest = migrator.latest_version();
+
+    if current > latest {
+        return Err(zagent_core::Error::session(format!(
+            "Database migration version {current} is newer than this zAgent build supports (latest {latest}). Upgrade zAgent before starting."
+        )));
+    }
+
+    if current == latest {
+        info!(
+            current_version = current,
+            latest_version = latest,
+            "SurrealDB schema is up to date"
+        );
+        return Ok(());
+    }
+
+    if auto_migrate_latest {
+        info!(
+            current_version = current,
+            latest_version = latest,
+            "SurrealDB schema is out of date; applying migrations"
+        );
+        migrator.migrate_to_latest().await?;
+        info!(
+            latest_version = latest,
+            "SurrealDB migrations applied successfully"
+        );
+        return Ok(());
+    }
+
+    Err(zagent_core::Error::session(format!(
+        "Database schema is out of date: current migration version is {current}, latest is {latest}. Set ZAGENT_AUTO_MIGRATE_LATEST=1 to auto-apply migrations on startup, or run the migrations API before starting."
+    )))
 }
 
 fn decode_session_payload(payload_json: &str) -> Result<SessionState> {

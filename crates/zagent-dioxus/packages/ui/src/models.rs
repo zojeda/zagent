@@ -19,11 +19,24 @@ pub struct AgentNodeView {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct AgentTimelineEntryView {
-    pub text: String,
+    pub title: String,
+    pub request_text: String,
+    pub response_text: Option<String>,
     pub kind: String,
     pub phase: String,
     pub sequence: Option<u64>,
-    pub event_id: Option<String>,
+    pub request_event_id: Option<String>,
+    pub response_event_id: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub running: bool,
+    pub show_terminal: bool,
+    pub terminal_segments: Vec<TerminalSegmentView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TerminalSegmentView {
+    pub channel: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -35,6 +48,13 @@ pub struct ChatTurnView {
     pub agent_roots: Vec<AgentNodeView>,
     pub agent_details_collapsed: bool,
     pub agent_details_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PromptImagePreviewView {
+    pub id: usize,
+    pub name: String,
+    pub data_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

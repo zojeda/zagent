@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 zagent-core = { path = "../zagent-core" }
+zagent-loop = { path = "../zagent-loop" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -13,7 +14,7 @@ tokio = { workspace = true }
 chrono = { workspace = true }
 
 async-trait = "0.1"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
 surrealdb = { version = "3.0.0", default-features = false, features = ["protocol-ws"] }
 axum = { version = "0.8", features = ["json"] }
 tower-http = { version = "0.6", features = ["cors"] }
@@ -21,6 +22,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"]
 tracing-appender = "0.2"
 tokio-stream = "0.1"
 rmcp = { version = "0.16", features = ["client", "transport-child-process"] }
+base64 = "0.22"
+hound = "3.5"
+whisper-apr = { version = "0.2.7", features = ["converter"] }
+safetensors = "0.4"
+half = "2"
+path_jail = "0.3"
 
 [features]
 default = []

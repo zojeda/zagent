@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -60,6 +61,18 @@ pub struct ConversationLine {
 #[derive(Debug, Clone, Serialize)]
 struct MessageRequest {
     input: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TranscribeRequest {
+    audio_wav_base64: String,
+    language: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TranscribeResponse {
+    #[serde(default)]
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -130,6 +143,14 @@ impl ProxyClient {
         start_message(&self.base_url, input).await
     }
 
+    pub async fn transcribe_wav(
+        &self,
+        wav_bytes: &[u8],
+        language: Option<&str>,
+    ) -> Result<TranscribeResponse, String> {
+        transcribe_wav(&self.base_url, wav_bytes, language).await
+    }
+
     pub async fn fetch_model_event_details(
         &self,
         session_id: Option<&str>,
@@ -196,6 +217,39 @@ pub async fn start_message(base_url: &str, input: &str) -> Result<(), String> {
 }
 
 #[cfg(target_arch = "wasm32")]
+pub async fn transcribe_wav(
+    base_url: &str,
+    wav_bytes: &[u8],
+    language: Option<&str>,
+) -> Result<TranscribeResponse, String> {
+    let body = TranscribeRequest {
+        audio_wav_base64: base64::engine::general_purpose::STANDARD.encode(wav_bytes),
+        language: language.map(ToString::to_string),
+    };
+
+    let resp =
+        gloo_net::http::Request::post(&format!("{}/api/transcribe", normalize_base_url(base_url)))
+            .json(&body)
+            .map_err(|e| format!("request build failed: {:?}", e))?
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {e}"))?;
+
+    if resp.status() >= 400 {
+        let body = resp
+            .json::<ApiErrorResponse>()
+            .await
+            .map(|e| e.error)
+            .unwrap_or_else(|_| "transcription request failed".to_string());
+        return Err(body);
+    }
+
+    resp.json::<TranscribeResponse>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+#[cfg(target_arch = "wasm32")]
 pub async fn fetch_model_event_details(
     base_url: &str,
     session_id: Option<&str>,
@@ -235,6 +289,37 @@ pub async fn fetch_model_event_details(
     }
 
     resp.json::<ModelEventDetailsSnapshot>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn transcribe_wav(
+    base_url: &str,
+    wav_bytes: &[u8],
+    language: Option<&str>,
+) -> Result<TranscribeResponse, String> {
+    let body = TranscribeRequest {
+        audio_wav_base64: base64::engine::general_purpose::STANDARD.encode(wav_bytes),
+        language: language.map(ToString::to_string),
+    };
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/transcribe", normalize_base_url(base_url)))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if resp.status().as_u16() >= 400 {
+        let body = resp
+            .json::<ApiErrorResponse>()
+            .await
+            .map(|e| e.error)
+            .unwrap_or_else(|_| "transcription request failed".to_string());
+        return Err(body);
+    }
+
+    resp.json::<TranscribeResponse>()
         .await
         .map_err(|e| format!("invalid response: {e}"))
 }

@@ -28,7 +28,8 @@ impl LocalProvider {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Provider for LocalProvider {
     fn name(&self) -> &str {
         "local"
@@ -115,7 +116,8 @@ mod tests {
         response: Arc<Mutex<Option<HttpResponse>>>,
     }
 
-    #[async_trait]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl HttpClient for RecordingHttpClient {
         async fn send(&self, request: HttpRequest) -> Result<HttpResponse> {
             self.requests.lock().expect("requests lock").push(request);

@@ -1,23 +1,19 @@
 use async_trait::async_trait;
 use serde_json::Value;
-use std::path::Path;
-use tokio::fs;
 
 use zagent_core::Result;
 use zagent_core::tools::Tool;
 
-/// List directory contents.
-pub struct ListDirTool;
+use crate::fs::SharedFileSystem;
 
-impl Default for ListDirTool {
-    fn default() -> Self {
-        Self::new()
-    }
+/// List directory contents.
+pub struct ListDirTool {
+    file_system: SharedFileSystem,
 }
 
 impl ListDirTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(file_system: SharedFileSystem) -> Self {
+        Self { file_system }
     }
 }
 
@@ -66,78 +62,36 @@ impl Tool for ListDirTool {
 
         let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
 
-        let path = Path::new(path);
-        if !path.exists() {
-            return Err(zagent_core::Error::tool(
-                "list_dir",
-                format!("Path '{}' does not exist", path.display()),
-            ));
-        }
-        if !path.is_dir() {
-            return Err(zagent_core::Error::tool(
-                "list_dir",
-                format!("'{}' is not a directory", path.display()),
-            ));
-        }
-
-        let mut entries = Vec::new();
-        list_dir_inner(path, &mut entries, recursive, 0, max_depth).await?;
-        entries.sort();
+        let mut entries = self
+            .file_system
+            .list_dir(path, recursive, max_depth)
+            .await
+            .map_err(|e| zagent_core::Error::tool("list_dir", e.to_string()))?;
+        entries.retain(|entry| {
+            !(entry.depth == 0
+                && entry.name.starts_with('.')
+                && entry.name != ".env"
+                && entry.name != ".gitignore")
+        });
 
         if entries.is_empty() {
             Ok("(empty directory)".to_string())
         } else {
-            Ok(entries.join("\n"))
+            Ok(entries
+                .into_iter()
+                .map(|entry| {
+                    let indent = "  ".repeat(entry.depth);
+                    if entry.is_dir {
+                        format!("{indent}{}/", entry.name)
+                    } else {
+                        let size_str = format_size(entry.size);
+                        format!("{indent}{}  ({size_str})", entry.name)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
         }
     }
-}
-
-fn list_dir_inner<'a>(
-    dir: &'a Path,
-    entries: &'a mut Vec<String>,
-    recursive: bool,
-    depth: usize,
-    max_depth: usize,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-    Box::pin(async move {
-        let mut read_dir = fs::read_dir(dir).await.map_err(|e| {
-            zagent_core::Error::tool(
-                "list_dir",
-                format!("Failed to read '{}': {e}", dir.display()),
-            )
-        })?;
-
-        let indent = "  ".repeat(depth);
-
-        while let Some(entry) = read_dir.next_entry().await.map_err(|e| {
-            zagent_core::Error::tool("list_dir", format!("Failed to read entry: {e}"))
-        })? {
-            let file_name = entry.file_name();
-            let name = file_name.to_string_lossy();
-
-            // Skip hidden files at depth 0 unless they're important
-            if depth == 0 && name.starts_with('.') && name != ".env" && name != ".gitignore" {
-                continue;
-            }
-
-            let metadata = entry.metadata().await.map_err(|e| {
-                zagent_core::Error::tool("list_dir", format!("Failed to read metadata: {e}"))
-            })?;
-
-            if metadata.is_dir() {
-                entries.push(format!("{indent}{name}/"));
-                if recursive && depth < max_depth {
-                    list_dir_inner(&entry.path(), entries, recursive, depth + 1, max_depth).await?;
-                }
-            } else {
-                let size = metadata.len();
-                let size_str = format_size(size);
-                entries.push(format!("{indent}{name}  ({size_str})"));
-            }
-        }
-
-        Ok(())
-    })
 }
 
 fn format_size(bytes: u64) -> String {

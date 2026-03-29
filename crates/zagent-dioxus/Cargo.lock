@@ -42,6 +42,7 @@ checksum = "5f0e0fee31ef5ed1ba1316088939cea399010ed7731dba877ed44aeb407a75ea"
 name = "api"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "gloo-net",
  "reqwest",
  "serde",
@@ -5503,6 +5504,7 @@ dependencies = [
  "serde_json",
  "ui",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 

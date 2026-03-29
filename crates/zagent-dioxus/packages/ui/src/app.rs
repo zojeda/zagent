@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use crate::models::{ChatTurnView, FooterTotalsView, ServerTabView};
+use crate::models::{ChatTurnView, FooterTotalsView, PromptImagePreviewView, ServerTabView};
 use crate::styles::UiWidgetStyles;
 use crate::widgets::{ChatTimeline, FooterTotals, PromptInput, ServerTabs};
 
@@ -10,7 +10,10 @@ pub struct DashboardProps {
     pub status_text: String,
     pub connected: bool,
     pub pending: bool,
+    pub recording: bool,
+    pub transcribing: bool,
     pub prompt_value: String,
+    pub prompt_images: Vec<PromptImagePreviewView>,
     pub turns: Vec<ChatTurnView>,
     pub totals: FooterTotalsView,
     pub tabs: Vec<ServerTabView>,
@@ -25,6 +28,12 @@ pub struct DashboardProps {
     pub on_connect_submit: EventHandler<()>,
     pub on_prompt_input: EventHandler<String>,
     pub on_submit: EventHandler<()>,
+    pub on_copy_prompt: Option<EventHandler<()>>,
+    pub on_paste_prompt: Option<EventHandler<()>>,
+    pub on_prompt_paste: Option<EventHandler<ClipboardEvent>>,
+    pub on_pick_images: Option<EventHandler<()>>,
+    pub on_remove_prompt_image: EventHandler<usize>,
+    pub on_toggle_recording: Option<EventHandler<()>>,
     pub on_toggle_turn_details: EventHandler<usize>,
     pub on_open_model_event: EventHandler<String>,
     pub on_conversation_scroll: EventHandler<()>,
@@ -109,8 +118,17 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                 PromptInput {
                     value: props.prompt_value,
                     pending: props.pending,
+                    recording: props.recording,
+                    transcribing: props.transcribing,
+                    image_previews: props.prompt_images,
                     on_input: props.on_prompt_input,
                     on_submit: props.on_submit,
+                    on_copy: props.on_copy_prompt,
+                    on_paste: props.on_paste_prompt,
+                    on_native_paste: props.on_prompt_paste,
+                    on_pick_images: props.on_pick_images,
+                    on_remove_image: props.on_remove_prompt_image,
+                    on_toggle_recording: props.on_toggle_recording,
                     div { class: "prompt-hint", "Shift future tools here" }
                 }
             }

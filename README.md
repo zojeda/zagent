@@ -42,6 +42,8 @@ just check
 just run-server
 ```
 
+For deployment topologies, runtime differences, VFS ownership, and Mermaid diagrams, see [docs/deployment.md](docs/deployment.md).
+
 ### Usage
 
 #### Usage Examples
@@ -535,6 +537,11 @@ cp .env.example .env
 
 ```yaml
 default_provider: openai
+context_management_policy:
+  include_agents_md: true
+  include_rules_md: true
+  include_skills: true
+  include_custom_agents: true
 providers:
   openai:
     auth_method: api_key
@@ -545,6 +552,11 @@ providers:
 
 ```yaml
 default_provider: openai
+context_management_policy:
+  include_agents_md: true
+  include_rules_md: true
+  include_skills: true
+  include_custom_agents: true
 providers:
   openai:
     auth_method: chatgpt_subscription
@@ -567,6 +579,11 @@ This first pass stores the current access token plus account/workspace id. It do
 
 ```yaml
 default_provider: local
+context_management_policy:
+  include_agents_md: true
+  include_rules_md: true
+  include_skills: false
+  include_custom_agents: true
 providers:
   local:
     base_url: http://127.0.0.1:1234/v1
@@ -574,6 +591,21 @@ providers:
     api_key_env: ZAGENT_PROVIDER_LOCAL_API_KEY
     default_model: qwen2.5-coder-7b-instruct
 ```
+
+`context_management_policy` controls which workspace instructions are folded into the effective system prompt. All keys default to `true`, so you only need to set the ones you want to disable:
+
+```yaml
+context_management_policy:
+  include_agents_md: true
+  include_rules_md: false
+  include_skills: false
+  include_custom_agents: true
+```
+
+- `include_agents_md`: include discovered `AGENTS.md` files
+- `include_rules_md`: include discovered `RULES.md` files
+- `include_skills`: include discovered `SKILL.md` catalogs
+- `include_custom_agents`: include custom agents loaded from the workspace catalog
 
 For local providers, zAgent does not invent a default model. Configure `providers.local.default_model` or `ZAGENT_PROVIDER_LOCAL_DEFAULT_MODEL` to match a model your server actually exposes from `/models`. Use `local:model-name` when selecting it explicitly on the CLI.
 

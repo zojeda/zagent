@@ -12,6 +12,13 @@ tracing = { workspace = true }
 derive_more = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+futures-util = "0.3"
 
 # Async trait support
 async-trait = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true }

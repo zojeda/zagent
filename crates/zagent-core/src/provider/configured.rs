@@ -763,7 +763,14 @@ mod tests {
     use crate::config::ProviderConfig;
     use crate::provider::types::{ChatRequest, Message};
     use std::collections::BTreeMap;
+    use std::sync::{Mutex, MutexGuard};
     use uuid::Uuid;
+
+    static DEFAULT_MODEL_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn default_model_env_guard() -> MutexGuard<'static, ()> {
+        DEFAULT_MODEL_ENV_LOCK.lock().expect("env lock")
+    }
 
     fn config_with_provider(name: &str, provider: ProviderConfig) -> ZagentConfig {
         let mut providers = BTreeMap::new();
@@ -771,6 +778,7 @@ mod tests {
         ZagentConfig {
             default_provider: None,
             default_model: None,
+            context_management_policy: Default::default(),
             providers,
             mcp_servers: BTreeMap::new(),
         }
@@ -855,6 +863,7 @@ mod tests {
 
     #[test]
     fn openai_default_model_is_gpt_5_2() {
+        let _guard = default_model_env_guard();
         assert_eq!(
             resolve_default_model("openai", &ZagentConfig::default()).expect("model"),
             "gpt-5.2"
@@ -906,6 +915,7 @@ mod tests {
 
     #[test]
     fn local_provider_default_model_must_be_configured() {
+        let _guard = default_model_env_guard();
         let err = resolve_default_model("local", &ZagentConfig::default())
             .expect_err("local default model should require configuration");
         assert!(err.to_string().contains("providers.local.default_model"));
@@ -922,6 +932,7 @@ mod tests {
 
     #[test]
     fn workspace_default_model_keeps_configured_provider_prefix() {
+        let _guard = default_model_env_guard();
         let providers = build_configured_providers(
             &config_with_provider(
                 "openai",
@@ -937,6 +948,7 @@ mod tests {
         let config = ZagentConfig {
             default_provider: Some("openai".to_string()),
             default_model: None,
+            context_management_policy: Default::default(),
             providers: {
                 let mut providers = BTreeMap::new();
                 providers.insert(
@@ -1142,6 +1154,7 @@ mod tests {
 
     #[test]
     fn env_default_model_with_vendor_prefix_selects_openrouter() {
+        let _guard = default_model_env_guard();
         unsafe {
             std::env::set_var("ZAGENT_DEFAULT_MODEL", "minimax/minimax-m2.5");
         }
@@ -1150,6 +1163,7 @@ mod tests {
             &ZagentConfig {
                 default_provider: Some("openai".to_string()),
                 default_model: None,
+                context_management_policy: Default::default(),
                 providers: {
                     let mut providers = BTreeMap::new();
                     providers.insert(
@@ -1188,6 +1202,7 @@ mod tests {
         let config = ZagentConfig {
             default_provider: Some("openai".to_string()),
             default_model: None,
+            context_management_policy: Default::default(),
             providers: {
                 let mut providers = BTreeMap::new();
                 providers.insert("openai".to_string(), ProviderConfig::default());

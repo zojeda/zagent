@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 zagent-core = { path = "../zagent-core" }
+zagent-loop = { path = "../zagent-loop" }
 
 # -- Workspace deps
 serde = { workspace = true }

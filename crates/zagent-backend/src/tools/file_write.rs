@@ -1,22 +1,19 @@
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::fs;
 
 use zagent_core::Result;
 use zagent_core::tools::Tool;
 
-/// Write content to a file, creating it and its parent directories if needed.
-pub struct FileWriteTool;
+use crate::fs::SharedFileSystem;
 
-impl Default for FileWriteTool {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Write content to a file, creating it and its parent directories if needed.
+pub struct FileWriteTool {
+    file_system: SharedFileSystem,
 }
 
 impl FileWriteTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(file_system: SharedFileSystem) -> Self {
+        Self { file_system }
     }
 }
 
@@ -59,21 +56,12 @@ impl Tool for FileWriteTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| zagent_core::Error::tool("file_write", "Missing 'content' parameter"))?;
 
-        // Create parent directories if needed
-        if let Some(parent) = std::path::Path::new(path).parent()
-            && !parent.exists()
-        {
-            fs::create_dir_all(parent).await.map_err(|e| {
-                zagent_core::Error::tool(
-                    "file_write",
-                    format!("Failed to create directory '{}': {e}", parent.display()),
-                )
+        self.file_system
+            .write_string(path, content)
+            .await
+            .map_err(|e| {
+                zagent_core::Error::tool("file_write", format!("Failed to write '{path}': {e}"))
             })?;
-        }
-
-        fs::write(path, content).await.map_err(|e| {
-            zagent_core::Error::tool("file_write", format!("Failed to write '{path}': {e}"))
-        })?;
 
         let line_count = content.lines().count();
         let byte_count = content.len();

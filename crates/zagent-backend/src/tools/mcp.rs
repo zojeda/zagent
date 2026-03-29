@@ -30,6 +30,7 @@ impl Tool for McpTool {
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
+            "properties": {},
             "additionalProperties": true
         })
     }

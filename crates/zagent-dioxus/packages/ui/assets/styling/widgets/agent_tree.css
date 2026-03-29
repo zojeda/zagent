@@ -145,27 +145,99 @@
   font-size: 0.8rem;
 }
 
-.timeline ul {
-  margin: 0.4rem 0 0.2rem 1.1rem;
-  padding: 0;
+.timeline-list {
+  margin-top: 0.45rem;
+  display: grid;
+  gap: 0.45rem;
 }
 
-.timeline li {
-  margin: 0.2rem 0;
+.timeline-entry-card {
+  border: 1px solid #dfe7dc;
+  border-radius: 10px;
+  padding: 0.45rem 0.55rem;
+  background: #ffffff;
+}
+
+.timeline-entry-card-model {
+  border-left: 3px solid #bfd8ff;
+}
+
+.timeline-entry-card-tool {
+  border-left: 3px solid #e6d2a8;
+}
+
+.timeline-entry-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.6rem;
+  align-items: flex-start;
+}
+
+.timeline-entry-headline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+}
+
+.timeline-entry-title {
+  color: #324234;
+  font: 0.78rem/1.35 "IBM Plex Mono", "Cascadia Mono", monospace;
+  font-weight: 600;
+}
+
+.timeline-entry-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.35rem;
+}
+
+.timeline-entry-request,
+.timeline-entry-response {
+  margin: 0.35rem 0 0;
   color: #4f5f53;
   font: 0.78rem/1.35 "IBM Plex Mono", "Cascadia Mono", monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
-.timeline-entry {
-  display: flex;
-  align-items: center;
-  gap: 0.45rem;
-  flex-wrap: wrap;
+.timeline-entry-response {
+  color: #3b4d3f;
 }
 
-.timeline-entry-text {
-  flex: 1 1 auto;
-  min-width: 240px;
+.timeline-entry-body {
+  margin-top: 0.4rem;
+}
+
+.timeline-entry-id,
+.timeline-entry-live {
+  border-radius: 999px;
+  padding: 0.08rem 0.42rem;
+  font-size: 0.68rem;
+  border: 1px solid #d8e2d6;
+  background: #f3f7f1;
+  color: #516253;
+}
+
+.timeline-entry-live {
+  border-color: #b8d8bb;
+  background: #ecf9ee;
+  color: #1f7a35;
+}
+
+.timeline-expand-toggle {
+  border: 1px solid #d0dbcd;
+  background: #f7faf6;
+  color: #385039;
+  border-radius: 8px;
+  padding: 0.2rem 0.48rem;
+  font-size: 0.73rem;
+  cursor: pointer;
+}
+
+.timeline-expand-toggle.open {
+  background: #eef5ec;
 }
 
 .child-cards {

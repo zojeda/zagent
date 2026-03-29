@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::agent::ContextManagementPolicy;
 use crate::{Error, Result};
 
 const CONFIG_FILE_NAME: &str = "zagent-config.yaml";
@@ -14,9 +15,52 @@ pub struct ZagentConfig {
     #[serde(default)]
     pub default_model: Option<String>,
     #[serde(default)]
+    pub context_management_policy: ContextManagementPolicyConfig,
+    #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ContextManagementPolicyConfig {
+    #[serde(default)]
+    pub include_agents_md: Option<bool>,
+    #[serde(default)]
+    pub include_rules_md: Option<bool>,
+    #[serde(default)]
+    pub include_skills: Option<bool>,
+    #[serde(default)]
+    pub include_custom_agents: Option<bool>,
+}
+
+impl ContextManagementPolicyConfig {
+    fn merge_from(&mut self, other: &ContextManagementPolicyConfig) {
+        if other.include_agents_md.is_some() {
+            self.include_agents_md = other.include_agents_md;
+        }
+        if other.include_rules_md.is_some() {
+            self.include_rules_md = other.include_rules_md;
+        }
+        if other.include_skills.is_some() {
+            self.include_skills = other.include_skills;
+        }
+        if other.include_custom_agents.is_some() {
+            self.include_custom_agents = other.include_custom_agents;
+        }
+    }
+
+    fn resolve(&self) -> ContextManagementPolicy {
+        let defaults = ContextManagementPolicy::default();
+        ContextManagementPolicy {
+            include_agents_md: self.include_agents_md.unwrap_or(defaults.include_agents_md),
+            include_rules_md: self.include_rules_md.unwrap_or(defaults.include_rules_md),
+            include_skills: self.include_skills.unwrap_or(defaults.include_skills),
+            include_custom_agents: self
+                .include_custom_agents
+                .unwrap_or(defaults.include_custom_agents),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -107,6 +151,8 @@ impl ZagentConfig {
         if other.default_model.is_some() {
             self.default_model = other.default_model;
         }
+        self.context_management_policy
+            .merge_from(&other.context_management_policy);
         for (name, incoming) in other.providers {
             self.providers
                 .entry(name)
@@ -119,6 +165,10 @@ impl ZagentConfig {
                 .and_modify(|existing| existing.merge_from(&incoming))
                 .or_insert(incoming);
         }
+    }
+
+    pub fn resolved_context_management_policy(&self) -> ContextManagementPolicy {
+        self.context_management_policy.resolve()
     }
 }
 
@@ -197,4 +247,66 @@ fn home_dir() -> Option<PathBuf> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ContextManagementPolicyConfig, ZagentConfig};
+
+    #[test]
+    fn context_management_policy_defaults_to_enabled() {
+        let config = ZagentConfig::default();
+        let policy = config.resolved_context_management_policy();
+
+        assert!(policy.include_agents_md);
+        assert!(policy.include_rules_md);
+        assert!(policy.include_skills);
+        assert!(policy.include_custom_agents);
+    }
+
+    #[test]
+    fn context_management_policy_merges_partial_overrides() {
+        let mut merged = ZagentConfig {
+            context_management_policy: ContextManagementPolicyConfig {
+                include_agents_md: Some(false),
+                include_rules_md: None,
+                include_skills: Some(false),
+                include_custom_agents: None,
+            },
+            ..ZagentConfig::default()
+        };
+        merged.merge_from(ZagentConfig {
+            context_management_policy: ContextManagementPolicyConfig {
+                include_agents_md: None,
+                include_rules_md: Some(false),
+                include_skills: None,
+                include_custom_agents: Some(false),
+            },
+            ..ZagentConfig::default()
+        });
+
+        let policy = merged.resolved_context_management_policy();
+        assert!(!policy.include_agents_md);
+        assert!(!policy.include_rules_md);
+        assert!(!policy.include_skills);
+        assert!(!policy.include_custom_agents);
+    }
+
+    #[test]
+    fn context_management_policy_deserializes_from_yaml() {
+        let config: ZagentConfig = serde_yaml::from_str(
+            r#"
+context_management_policy:
+  include_agents_md: false
+  include_rules_md: false
+"#,
+        )
+        .expect("config should deserialize");
+
+        let policy = config.resolved_context_management_policy();
+        assert!(!policy.include_agents_md);
+        assert!(!policy.include_rules_md);
+        assert!(policy.include_skills);
+        assert!(policy.include_custom_agents);
+    }
 }

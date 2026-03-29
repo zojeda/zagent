@@ -1,0 +1,59 @@
+.timeline-terminal-shell {
+  width: 100%;
+  margin-top: 0.35rem;
+}
+
+.timeline-terminal-summary {
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: #304236;
+  font: 0.76rem/1.35 "IBM Plex Mono", "Cascadia Mono", monospace;
+}
+
+.timeline-terminal-live-badge {
+  border-radius: 999px;
+  border: 1px solid #b8d8bb;
+  background: #ecf9ee;
+  color: #1f7a35;
+  padding: 0.08rem 0.42rem;
+  font-size: 0.68rem;
+  font-family: inherit;
+}
+
+.timeline-terminal {
+  width: 100%;
+  margin-top: 0.35rem;
+  border-radius: 10px;
+  border: 1px solid #d7e1d5;
+  background: #13211a;
+  color: #eef7ee;
+  padding: 0.45rem 0.55rem;
+  overflow: auto;
+}
+
+.timeline-terminal-segment {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: 0.76rem/1.4 "IBM Plex Mono", "Cascadia Mono", monospace;
+}
+
+.timeline-terminal-stdout {
+  color: #d9f9df;
+}
+
+.timeline-terminal-stderr {
+  color: #ffb7b0;
+}
+
+.timeline-terminal-system {
+  color: #f6da98;
+}
+
+.timeline-terminal-status {
+  margin-top: 0.3rem;
+  color: #93b39c;
+  font: 0.72rem/1.35 "IBM Plex Mono", "Cascadia Mono", monospace;
+}

@@ -17,6 +17,8 @@ use crate::engine::{
     ModelCatalogSnapshot, ModelEventDetailsSnapshot, UiEvent,
 };
 use crate::migrations::MigrationStatus;
+use crate::shell_stream;
+use crate::whisper::{TranscribeRequest, TranscribeResponse};
 use zagent_core::session::SessionEvent;
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +176,7 @@ pub fn router(engine: BackendEngine) -> Router {
         .route("/api/session/model-events", get(get_model_events))
         .route("/api/message", post(post_message))
         .route("/api/message/start", post(start_message))
+        .route("/api/transcribe", post(post_transcribe))
         .route("/api/events/stream", get(get_events_stream))
         .route("/api/models", get(get_models))
         .route("/api/migrations", get(get_migrations_status))
@@ -384,6 +387,20 @@ async fn start_message(
     Ok(axum::http::StatusCode::ACCEPTED)
 }
 
+async fn post_transcribe(
+    Json(req): Json<TranscribeRequest>,
+) -> Result<Json<TranscribeResponse>, (axum::http::StatusCode, Json<ApiError>)> {
+    match crate::whisper::transcribe_wav(req).await {
+        Ok(resp) => Ok(Json(resp)),
+        Err(e) => Err((
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: e.to_string(),
+            }),
+        )),
+    }
+}
+
 async fn post_message_stream(
     State(state): State<ApiState>,
     Json(req): Json<MessageRequest>,
@@ -529,6 +546,7 @@ async fn run_message_turn(
         .await;
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
+    let mut shell_rx = shell_stream::subscribe();
     let forwarder = state
         .engine
         .subscribe_session_events()
@@ -593,6 +611,34 @@ async fn run_message_turn(
                     }, true).await;
                 } else {
                     events_open = false;
+                }
+            }
+            shell_chunk = shell_rx.recv() => {
+                match shell_chunk {
+                    Ok(chunk) => {
+                        state.stream_hub.publish(StreamChunk {
+                            seq: None,
+                            kind: "event".to_string(),
+                            text: None,
+                            message: None,
+                            event: Some(UiEvent {
+                                kind: "tool_stream".to_string(),
+                                title: format!("shell {}", chunk.channel),
+                                detail: format!("stream {}", chunk.channel),
+                                payload: Some(serde_json::json!({
+                                    "stream_id": chunk.stream_id,
+                                    "tool_call_id": chunk.stream_id,
+                                    "channel": chunk.channel,
+                                    "text": chunk.text,
+                                })),
+                            }),
+                            response: None,
+                            snapshot: None,
+                            submitted: None,
+                        }, true).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                 }
             }
             res = &mut done_rx => {
@@ -712,6 +758,7 @@ fn session_event_to_ui_event(event: SessionEvent) -> Option<UiEvent> {
         model,
         model_ref: _,
         tool_name,
+        tool_call_id,
         success,
         finish_reason,
         latency_ms,
@@ -836,6 +883,9 @@ fn session_event_to_ui_event(event: SessionEvent) -> Option<UiEvent> {
                 .as_deref()
                 .or_else(|| payload.get("tool_name").and_then(|v| v.as_str()))
                 .unwrap_or("unknown");
+            let tool_call_id = tool_call_id
+                .as_deref()
+                .or_else(|| payload.get("tool_call_id").and_then(|v| v.as_str()));
             let arguments = arguments
                 .as_ref()
                 .map(|v| serde_json::Value::String(v.clone()))
@@ -852,6 +902,7 @@ fn session_event_to_ui_event(event: SessionEvent) -> Option<UiEvent> {
                     "agent": agent,
                     "handoff_depth": handoff_depth,
                     "turn": turn,
+                    "tool_call_id": tool_call_id,
                     "tool_name": tool_name,
                     "arguments": arguments
                 })),
@@ -868,6 +919,9 @@ fn session_event_to_ui_event(event: SessionEvent) -> Option<UiEvent> {
             let latency_ms = latency_ms
                 .or_else(|| payload.get("latency_ms").and_then(|v| v.as_u64()))
                 .unwrap_or(0);
+            let tool_call_id = tool_call_id
+                .as_deref()
+                .or_else(|| payload.get("tool_call_id").and_then(|v| v.as_str()));
             let result = result
                 .as_ref()
                 .map(|v| serde_json::Value::String(v.clone()))
@@ -888,6 +942,7 @@ fn session_event_to_ui_event(event: SessionEvent) -> Option<UiEvent> {
                     "agent": agent,
                     "handoff_depth": handoff_depth,
                     "turn": turn,
+                    "tool_call_id": tool_call_id,
                     "tool_name": tool_name,
                     "success": success,
                     "latency_ms": latency_ms,

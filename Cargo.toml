@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/zagent-backend","crates/zagent-core", "crates/zagent-native", "crates/zagent-server", "crates/zagent-tui", "crates/zagent-ui-shared", "crates/zagent-web", "crates/zagent-web-dev"]
+members = ["crates/zagent-backend","crates/zagent-core", "crates/zagent-loop", "crates/zagent-native", "crates/zagent-server", "crates/zagent-tui", "crates/zagent-ui-shared", "crates/zagent-wasm", "crates/zagent-web", "crates/zagent-web-demo", "crates/zagent-web-dev"]
 resolver = "2"
 
 [workspace.package]
@@ -26,7 +26,7 @@ derive_more = { version = "2", features = ["from", "display"] }
 tokio = { version = "1", features = ["full"] }
 
 # -- UUID
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "js"] }
 
 # -- Time
 chrono = { version = "0.4", features = ["serde"] }

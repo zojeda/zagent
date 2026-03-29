@@ -5,6 +5,7 @@ use zagent_core::session::SessionStore;
 use zagent_core::tools::ToolRegistry;
 
 use crate::engine::{RuntimeTarget, SessionStoreTarget};
+use crate::fs::SharedFileSystem;
 use crate::mcp::McpManager;
 use crate::platform::NativeHttpClient;
 use crate::session_store::SurrealSessionStore;
@@ -19,6 +20,7 @@ pub struct RuntimeBundle {
     pub session_event_store: Option<Arc<dyn SessionStore>>,
     pub session_admin_store: Option<Arc<SurrealSessionStore>>,
     pub tools: Arc<ToolRegistry>,
+    pub workspace_fs: Option<SharedFileSystem>,
     pub mcp_manager: Option<Arc<McpManager>>,
 }
 
@@ -29,10 +31,36 @@ pub async fn build_runtime(
     working_dir: &str,
     mcp_manager: Option<Arc<McpManager>>,
 ) -> Result<RuntimeBundle, zagent_core::Error> {
+    let workspace_fs: SharedFileSystem =
+        Arc::new(crate::fs::RootedHostFileSystem::new(working_dir)?);
+    build_runtime_with_filesystem(
+        target,
+        session_store,
+        session_dir,
+        working_dir,
+        workspace_fs,
+        mcp_manager,
+    )
+    .await
+}
+
+pub async fn build_runtime_with_filesystem(
+    target: RuntimeTarget,
+    session_store: SessionStoreTarget,
+    session_dir: &str,
+    working_dir: &str,
+    workspace_fs: SharedFileSystem,
+    mcp_manager: Option<Arc<McpManager>>,
+) -> Result<RuntimeBundle, zagent_core::Error> {
     let http_client = Arc::new(NativeHttpClient::new());
     match target {
         RuntimeTarget::Native => {
-            let tools = tools::register_all_tools(working_dir, mcp_manager.clone()).await;
+            let tools = tools::register_all_tools_with_filesystem(
+                workspace_fs.clone(),
+                working_dir,
+                mcp_manager.clone(),
+            )
+            .await;
             match session_store {
                 SessionStoreTarget::Surreal => {
                     let endpoint = resolve_surreal_endpoint(session_dir);
@@ -44,6 +72,7 @@ pub async fn build_runtime(
                         session_event_store: Some(store.clone()),
                         session_admin_store: Some(store),
                         tools: Arc::new(tools),
+                        workspace_fs: Some(workspace_fs),
                         mcp_manager,
                     })
                 }
@@ -56,6 +85,7 @@ pub async fn build_runtime(
                         session_event_store: Some(store),
                         session_admin_store: None,
                         tools: Arc::new(tools),
+                        workspace_fs: Some(workspace_fs),
                         mcp_manager,
                     })
                 }
@@ -69,13 +99,14 @@ pub async fn build_runtime(
                         session_event_store: None,
                         session_admin_store: None,
                         tools: Arc::new(tools),
+                        workspace_fs: Some(workspace_fs),
                         mcp_manager,
                     })
                 }
             }
         }
         RuntimeTarget::Wasi => {
-            let tools = tools::register_wasi_tools();
+            let tools = tools::register_wasi_tools_with_filesystem(workspace_fs.clone());
             match session_store {
                 SessionStoreTarget::Surreal => {
                     let endpoint = resolve_surreal_endpoint(session_dir);
@@ -87,6 +118,7 @@ pub async fn build_runtime(
                         session_event_store: Some(store.clone()),
                         session_admin_store: Some(store),
                         tools: Arc::new(tools),
+                        workspace_fs: Some(workspace_fs),
                         mcp_manager: None,
                     })
                 }
@@ -99,6 +131,7 @@ pub async fn build_runtime(
                         session_event_store: None,
                         session_admin_store: None,
                         tools: Arc::new(tools),
+                        workspace_fs: Some(workspace_fs),
                         mcp_manager: None,
                     })
                 }
@@ -111,6 +144,7 @@ pub async fn build_runtime(
                         session_event_store: Some(store),
                         session_admin_store: None,
                         tools: Arc::new(tools),
+                        workspace_fs: Some(workspace_fs),
                         mcp_manager: None,
                     })
                 }

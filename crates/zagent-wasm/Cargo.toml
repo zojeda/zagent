@@ -1,0 +1,19 @@
+[package]
+name = "zagent-wasm"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+zagent-loop = { path = "../zagent-loop" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+zagent-core = { path = "../zagent-core" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+serde-wasm-bindgen = "0.6"
+js-sys = "0.3"
+gloo-net = { version = "0.6", features = ["http"] }
+console_error_panic_hook = "0.1"

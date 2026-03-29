@@ -161,7 +161,8 @@ fn role_name(role: &super::types::Role) -> &'static str {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Provider for OpenAiProvider {
     fn name(&self) -> &str {
         "openai"

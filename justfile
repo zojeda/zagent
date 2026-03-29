@@ -15,6 +15,7 @@ export SURREALDB_DB := "session_storage"
 export SURREALDB_CONTAINER := "zagent-surrealdb-dev"
 export DIOXUS := "dx"
 export DIOXUS_WEB_PORT := "8080"
+export WEB_DEMO_PORT := "8081"
 
 alias run-native-repl := run-native
 
@@ -112,6 +113,18 @@ run-web-dev:
 [group('Web')]
 run-web-manual:
     cd crates/zagent-web && $TRUNK serve --proxy-backend "$BACKEND_URL/api" --proxy-rewrite /api
+
+# Run the standalone embedded wasm demo page.
+[group('Web')]
+run-web-demo:
+    command -v "$TRUNK" >/dev/null 2>&1 || { echo "$TRUNK is required; run 'just trunk-install' first"; exit 1; }
+    cd crates/zagent-web-demo && $TRUNK serve --port "$WEB_DEMO_PORT"
+
+# Run the standalone embedded wasm demo page and open a browser automatically.
+[group('Web')]
+run-web-demo-open:
+    command -v "$TRUNK" >/dev/null 2>&1 || { echo "$TRUNK is required; run 'just trunk-install' first"; exit 1; }
+    cd crates/zagent-web-demo && $TRUNK serve --port "$WEB_DEMO_PORT" --open
 
 # Run SurrealDB, zagent-server, and the Dioxus web app together for local development.
 [group('Web')]

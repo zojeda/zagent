@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 
 use crate::models::AgentNodeView;
+use crate::widgets::TerminalStream;
 
 #[derive(Props, Clone, PartialEq)]
 pub struct AgentTreeProps {
@@ -77,31 +78,13 @@ fn AgentCard(props: AgentCardProps) -> Element {
                     }
                     p { class: "last-event", "{node.last_event}" }
                     if !node.timeline.is_empty() {
-                        details { class: "timeline",
+                        details { class: "timeline", open: true,
                             summary { "Event timeline ({node.timeline.len()})" }
-                            ul {
+                            div { class: "timeline-list",
                                 for entry in node.timeline {
-                                    li {
-                                        class: "timeline-entry",
-                                        span { class: "timeline-entry-text", "{entry.text}" }
-                                        if (entry.kind == "model"
-                                            && (entry.phase == "request_started"
-                                                || entry.phase == "response_received"))
-                                            || (entry.kind == "tool"
-                                                && (entry.phase == "start"
-                                                    || entry.phase == "finish"))
-                                        {
-                                            if let Some(event_id) = entry.event_id.clone() {
-                                                button {
-                                                    class: "model-json-action-button",
-                                                    onclick: {
-                                                        let on_open = props.on_open_model_event.clone();
-                                                        move |_| on_open.call(event_id.clone())
-                                                    },
-                                                    "Details"
-                                                }
-                                            }
-                                        }
+                                    TimelineEntryCard {
+                                        entry,
+                                        on_open_model_event: props.on_open_model_event.clone()
                                     }
                                 }
                             }
@@ -115,6 +98,91 @@ fn AgentCard(props: AgentCardProps) -> Element {
                                     on_open_model_event: props.on_open_model_event
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct TimelineEntryCardProps {
+    entry: crate::models::AgentTimelineEntryView,
+    on_open_model_event: EventHandler<String>,
+}
+
+#[component]
+fn TimelineEntryCard(props: TimelineEntryCardProps) -> Element {
+    let entry = props.entry;
+    let mut open = use_signal(|| entry.running);
+    let mut last_running = use_signal(|| entry.running);
+
+    use_effect(move || {
+        if last_running() != entry.running {
+            open.set(entry.running);
+            last_running.set(entry.running);
+        }
+    });
+
+    let can_expand = entry.response_text.is_some()
+        || (entry.show_terminal && !entry.terminal_segments.is_empty())
+        || entry.running;
+
+    rsx! {
+        article { class: "timeline-entry-card timeline-entry-card-{entry.kind}",
+            div { class: "timeline-entry-header",
+                div { class: "timeline-entry-headline",
+                    span { class: "timeline-entry-title", "{entry.title}" }
+                    if let Some(tool_call_id) = entry.tool_call_id.clone() {
+                        span { class: "timeline-entry-id", "#{tool_call_id}" }
+                    }
+                    if entry.running {
+                        span { class: "timeline-entry-live", "live" }
+                    }
+                }
+                div { class: "timeline-entry-actions",
+                    if let Some(event_id) = entry.request_event_id.clone() {
+                        button {
+                            class: "model-json-action-button",
+                            onclick: {
+                                let on_open = props.on_open_model_event.clone();
+                                move |_| on_open.call(event_id.clone())
+                            },
+                            "Request"
+                        }
+                    }
+                    if let Some(event_id) = entry.response_event_id.clone() {
+                        button {
+                            class: "model-json-action-button",
+                            onclick: {
+                                let on_open = props.on_open_model_event.clone();
+                                move |_| on_open.call(event_id.clone())
+                            },
+                            "Response"
+                        }
+                    }
+                    if can_expand {
+                        button {
+                            class: if open() { "timeline-expand-toggle open" } else { "timeline-expand-toggle" },
+                            onclick: move |_| open.set(!open()),
+                            if open() { "Hide" } else { "Show" }
+                        }
+                    }
+                }
+            }
+            p { class: "timeline-entry-request", "{entry.request_text}" }
+            if open() {
+                div { class: "timeline-entry-body",
+                    if let Some(response_text) = entry.response_text.clone() {
+                        p { class: "timeline-entry-response", "{response_text}" }
+                    }
+                    if entry.show_terminal && (!entry.terminal_segments.is_empty() || entry.running) {
+                        TerminalStream {
+                            key: "terminal-{entry.tool_call_id.clone().unwrap_or_default()}",
+                            tool_call_id: entry.tool_call_id.clone(),
+                            running: entry.running,
+                            segments: entry.terminal_segments.clone()
                         }
                     }
                 }

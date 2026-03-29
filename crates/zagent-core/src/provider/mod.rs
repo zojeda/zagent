@@ -45,7 +45,8 @@ pub struct HttpResponse {
 
 /// Platform-agnostic HTTP client trait.
 /// Implemented by native (reqwest) and WASI (wasi:http) backends.
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait HttpClient: Send + Sync {
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse>;
 }
@@ -86,7 +87,8 @@ impl ProviderResolver for StaticProviderResolver<'_> {
 ///
 /// Each LLM provider (OpenRouter, OpenAI, Ollama, etc.) implements this trait
 /// to handle authentication, URL routing, model naming, and request/response quirks.
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait Provider: Send + Sync {
     /// Provider display name
     fn name(&self) -> &str;

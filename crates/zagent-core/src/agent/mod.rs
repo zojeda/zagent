@@ -4,23 +4,44 @@ mod custom_agents;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use futures_util::future::join_all;
 use tracing::{Instrument, info, info_span, trace, warn};
 
 use crate::Result;
+use crate::fs::AgentFileSystem;
 use crate::provider::configured::split_provider_model;
 use crate::provider::types::{ChatRequest, ChatResponse, Message, ToolCall};
 use crate::provider::{HttpClient, ProviderResolver};
 use crate::session::{SessionEvent, SessionState, SessionStore, ToolExecutionRecord};
+use crate::time::{Stopwatch, utc_now};
 use crate::tools::ToolRegistry;
 use custom_agents::{
     CustomAgentDefinition, CustomAgentHandoffDefinition, ToolAccessPolicy, collect_custom_agents,
-    custom_agent_name_key, custom_agent_tool_definition, push_custom_agents_prompt_section,
-    resolve_allowed_runtime_tools, resolve_handoff_scope, resolve_user_invocation,
+    collect_custom_agents_from_fs, custom_agent_name_key, custom_agent_tool_definition,
+    push_custom_agents_prompt_section, resolve_allowed_runtime_tools, resolve_handoff_scope,
+    resolve_user_invocation,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContextManagementPolicy {
+    pub include_agents_md: bool,
+    pub include_rules_md: bool,
+    pub include_skills: bool,
+    pub include_custom_agents: bool,
+}
+
+impl Default for ContextManagementPolicy {
+    fn default() -> Self {
+        Self {
+            include_agents_md: true,
+            include_rules_md: true,
+            include_skills: true,
+            include_custom_agents: true,
+        }
+    }
+}
 
 /// Configuration for the agent loop
 #[derive(Debug, Clone)]
@@ -30,6 +51,7 @@ pub struct AgentConfig {
     pub max_turns: u32,
     pub max_tool_output_chars: usize,
     pub system_prompt: String,
+    pub context_management_policy: ContextManagementPolicy,
     pub active_custom_agent_id: Option<String>,
     pub handoff_depth: u32,
     pub visible_mcp_tools: Vec<String>,
@@ -43,6 +65,7 @@ impl Default for AgentConfig {
             max_turns: 50,
             max_tool_output_chars: 50_000,
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
+            context_management_policy: ContextManagementPolicy::default(),
             active_custom_agent_id: None,
             handoff_depth: 0,
             visible_mcp_tools: Vec::new(),
@@ -66,6 +89,7 @@ When you encounter errors, debug them by reading error output and fixing issues.
 Always tell the user what you're doing and why."#;
 
 const AGENTS_FILE_NAME: &str = "AGENTS.md";
+const RULES_FILE_NAME: &str = "RULES.md";
 const MAX_AGENTS_FILES: usize = 64;
 const MAX_AGENTS_FILE_BYTES: usize = 32_000;
 const SKILL_FILE_NAME: &str = "SKILL.md";
@@ -73,6 +97,7 @@ const MAX_SKILL_FILES: usize = 128;
 const MAX_SKILL_FILE_BYTES: usize = 32_000;
 const WALK_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", "dist", "logs"];
 const MAX_HANDOFF_DEPTH: u32 = 16;
+const WORKSPACE_SCAN_MAX_DEPTH: usize = 16;
 
 #[derive(Debug, Clone)]
 struct AgentsInstructionFile {
@@ -91,69 +116,42 @@ fn build_effective_system_prompt(
     base_system_prompt: &str,
     working_dir: &str,
     custom_agents: &[CustomAgentDefinition],
+    policy: &ContextManagementPolicy,
 ) -> String {
-    let instruction_files = collect_agents_instruction_files(working_dir);
-    let skills = collect_skill_definitions(working_dir);
-    let mut out = String::with_capacity(base_system_prompt.len() + 4096);
-    out.push_str(base_system_prompt);
-
-    if !instruction_files.is_empty() {
-        out.push_str("\n\n# Rules\n");
-        out.push_str(
-            "The following always-on workspace rules were discovered from AGENTS.md files. \
-Each block includes the path relative to the current working directory.\n\n",
-        );
-
-        for file in &instruction_files {
-            out.push_str(&format!(
-                "## Rule source: {}\n",
-                file.relative_path_from_cwd
-            ));
-            out.push_str(file.content.trim());
-            out.push_str("\n\n");
-        }
-
-        out.push_str(
-            "Precedence rules: explicit user chat instructions override AGENTS.md instructions. \
-When AGENTS.md files conflict, prioritize the file closest to the file being updated or \
-processed. More specific (deeper, nearer) files override broader ones.",
-        );
-    }
-
-    if !skills.is_empty() {
-        out.push_str("\n\n# Available Skills\n");
-        out.push_str(
-            "Task-specific skills are available as external prompt files. Keep the base prompt \
-lean: only read a skill with file_read when it is directly relevant to the task or the user \
-explicitly asks for it. When you load a skill, follow its instructions in addition to the rules \
-above.\n\n",
-        );
-
-        for skill in &skills {
-            out.push_str(&format!(
-                "- {}: {} [source: {}]\n",
-                skill.name, skill.description, skill.relative_path_from_cwd
-            ));
-        }
-    }
-
-    push_custom_agents_prompt_section(&mut out, custom_agents);
-
-    out
+    let instruction_files = collect_agents_instruction_files(working_dir, policy);
+    let skills = if policy.include_skills {
+        collect_skill_definitions(working_dir)
+    } else {
+        Vec::new()
+    };
+    build_effective_system_prompt_from_catalog(
+        base_system_prompt,
+        instruction_files,
+        skills,
+        custom_agents,
+        policy,
+    )
 }
 
-fn collect_agents_instruction_files(working_dir: &str) -> Vec<AgentsInstructionFile> {
+fn collect_agents_instruction_files(
+    working_dir: &str,
+    policy: &ContextManagementPolicy,
+) -> Vec<AgentsInstructionFile> {
+    if !policy.include_agents_md && !policy.include_rules_md {
+        return Vec::new();
+    }
+
     let cwd = resolve_path(working_dir);
     let root = find_git_root(&cwd);
     let mut discovered = Vec::new();
     let mut seen = HashSet::new();
 
-    for path in collect_ancestor_agents_paths(&cwd, &root) {
+    for path in collect_ancestor_agents_paths(&cwd, &root, policy) {
         if seen.insert(path.clone()) {
             discovered.push(path);
         }
     }
-    for path in collect_descendant_agents_paths(&cwd) {
+    for path in collect_descendant_agents_paths(&cwd, policy) {
         if seen.insert(path.clone()) {
             discovered.push(path);
         }
@@ -190,13 +188,22 @@ fn collect_agents_instruction_files(working_dir: &str) -> Vec<AgentsInstructionF
         .collect()
 }
 
-fn collect_ancestor_agents_paths(cwd: &Path, root: &Path) -> Vec<PathBuf> {
+fn collect_ancestor_agents_paths(
+    cwd: &Path,
+    root: &Path,
+    policy: &ContextManagementPolicy,
+) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut cursor = cwd.to_path_buf();
     loop {
-        let candidate = cursor.join(AGENTS_FILE_NAME);
-        if candidate.is_file() {
-            out.push(candidate);
+        for file_name in [AGENTS_FILE_NAME, RULES_FILE_NAME] {
+            if !should_include_rule_file(file_name, policy) {
+                continue;
+            }
+            let candidate = cursor.join(file_name);
+            if candidate.is_file() {
+                out.push(candidate);
+            }
         }
         if cursor == root {
             break;
@@ -209,7 +216,7 @@ fn collect_ancestor_agents_paths(cwd: &Path, root: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn collect_descendant_agents_paths(cwd: &Path) -> Vec<PathBuf> {
+fn collect_descendant_agents_paths(cwd: &Path, policy: &ContextManagementPolicy) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![cwd.to_path_buf()];
 
@@ -228,7 +235,7 @@ fn collect_descendant_agents_paths(cwd: &Path) -> Vec<PathBuf> {
             };
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if file_type.is_file() && name_str == AGENTS_FILE_NAME {
+            if file_type.is_file() && should_include_rule_file(&name_str, policy) {
                 out.push(path);
                 if out.len() >= MAX_AGENTS_FILES {
                     break;
@@ -261,6 +268,178 @@ fn collect_skill_definitions(working_dir: &str) -> Vec<SkillDefinition> {
         .into_iter()
         .filter_map(|path| load_skill_definition(&cwd, &path))
         .collect()
+}
+
+async fn collect_agents_instruction_files_from_fs(
+    file_system: &dyn AgentFileSystem,
+    policy: &ContextManagementPolicy,
+) -> Vec<AgentsInstructionFile> {
+    if !policy.include_agents_md && !policy.include_rules_md {
+        return Vec::new();
+    }
+
+    let Ok(mut entries) = file_system
+        .list_dir(".", true, WORKSPACE_SCAN_MAX_DEPTH)
+        .await
+    else {
+        return Vec::new();
+    };
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut out = Vec::new();
+    for entry in entries
+        .into_iter()
+        .filter(|entry| !entry.is_dir && should_include_rule_file(&entry.name, policy))
+        .take(MAX_AGENTS_FILES)
+    {
+        if let Some(content) =
+            read_clipped_text_file(file_system, &entry.path, MAX_AGENTS_FILE_BYTES).await
+        {
+            out.push(AgentsInstructionFile {
+                relative_path_from_cwd: entry.path,
+                content,
+            });
+        }
+    }
+    out
+}
+
+async fn collect_skill_definitions_from_fs(
+    file_system: &dyn AgentFileSystem,
+) -> Vec<SkillDefinition> {
+    let Ok(mut entries) = file_system
+        .list_dir(".", true, WORKSPACE_SCAN_MAX_DEPTH)
+        .await
+    else {
+        return Vec::new();
+    };
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut out = Vec::new();
+    for entry in entries
+        .into_iter()
+        .filter(|entry| !entry.is_dir && entry.name == SKILL_FILE_NAME)
+        .take(MAX_SKILL_FILES)
+    {
+        if let Some(content) =
+            read_clipped_text_file(file_system, &entry.path, MAX_SKILL_FILE_BYTES).await
+        {
+            let (manifest, body) = parse_skill_frontmatter(&content);
+            let path = Path::new(&entry.path);
+            let name = manifest
+                .name
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| infer_skill_name(path));
+            let description = manifest
+                .description
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| infer_skill_description(&body))
+                .unwrap_or_else(|| format!("Task-specific instructions for {name}"));
+            out.push(SkillDefinition {
+                name,
+                description,
+                relative_path_from_cwd: entry.path,
+            });
+        }
+    }
+    out
+}
+
+async fn build_effective_system_prompt_from_fs(
+    base_system_prompt: &str,
+    file_system: &dyn AgentFileSystem,
+    custom_agents: &[CustomAgentDefinition],
+    policy: &ContextManagementPolicy,
+) -> String {
+    let instruction_files = collect_agents_instruction_files_from_fs(file_system, policy).await;
+    let skills = if policy.include_skills {
+        collect_skill_definitions_from_fs(file_system).await
+    } else {
+        Vec::new()
+    };
+    build_effective_system_prompt_from_catalog(
+        base_system_prompt,
+        instruction_files,
+        skills,
+        custom_agents,
+        policy,
+    )
+}
+
+fn build_effective_system_prompt_from_catalog(
+    base_system_prompt: &str,
+    instruction_files: Vec<AgentsInstructionFile>,
+    skills: Vec<SkillDefinition>,
+    custom_agents: &[CustomAgentDefinition],
+    policy: &ContextManagementPolicy,
+) -> String {
+    let mut out = String::with_capacity(base_system_prompt.len() + 4096);
+    out.push_str(base_system_prompt);
+
+    if !instruction_files.is_empty() {
+        out.push_str("\n\n# Rules\n");
+        out.push_str(
+            "The following always-on workspace rules were discovered from AGENTS.md and RULES.md files. \
+Each block includes the path relative to the current working directory.\n\n",
+        );
+
+        for file in &instruction_files {
+            out.push_str(&format!(
+                "## Rule source: {}\n",
+                file.relative_path_from_cwd
+            ));
+            out.push_str(file.content.trim());
+            out.push_str("\n\n");
+        }
+
+        out.push_str(
+            "Precedence rules: explicit user chat instructions override workspace rule files. \
+When AGENTS.md or RULES.md files conflict, prioritize the file closest to the file being updated or \
+processed. More specific (deeper, nearer) files override broader ones.",
+        );
+    }
+
+    if !skills.is_empty() {
+        out.push_str("\n\n# Available Skills\n");
+        out.push_str(
+            "Task-specific skills are available as external prompt files. Keep the base prompt \
+lean: only read a skill with file_read when it is directly relevant to the task or the user \
+explicitly asks for it. When you load a skill, follow its instructions in addition to the rules \
+above.\n\n",
+        );
+
+        for skill in &skills {
+            out.push_str(&format!(
+                "- {}: {} [source: {}]\n",
+                skill.name, skill.description, skill.relative_path_from_cwd
+            ));
+        }
+    }
+
+    if policy.include_custom_agents {
+        push_custom_agents_prompt_section(&mut out, custom_agents);
+    }
+    out
+}
+
+fn should_include_rule_file(file_name: &str, policy: &ContextManagementPolicy) -> bool {
+    (policy.include_agents_md && file_name == AGENTS_FILE_NAME)
+        || (policy.include_rules_md && file_name == RULES_FILE_NAME)
+}
+
+async fn read_clipped_text_file(
+    file_system: &dyn AgentFileSystem,
+    path: &str,
+    max_bytes: usize,
+) -> Option<String> {
+    let content = file_system.read_to_string(path).await.ok()?;
+    let bytes = content.as_bytes();
+    if bytes.len() <= max_bytes {
+        return Some(content);
+    }
+
+    let clipped = String::from_utf8_lossy(&bytes[..max_bytes]).to_string();
+    Some(format!("{clipped}\n\n[truncated at {max_bytes} bytes]"))
 }
 
 fn collect_descendant_skill_paths(cwd: &Path) -> Vec<PathBuf> {
@@ -442,12 +621,14 @@ pub enum AgentProgressEvent {
     ToolCallStarted {
         agent: String,
         handoff_depth: u32,
+        tool_call_id: String,
         tool_name: String,
         arguments: String,
     },
     ToolCallFinished {
         agent: String,
         handoff_depth: u32,
+        tool_call_id: String,
         tool_name: String,
         success: bool,
         latency_ms: u64,
@@ -481,6 +662,11 @@ struct ToolExecutionOutcome {
     forwarded_events: Vec<AgentProgressEvent>,
 }
 
+struct ToolCallExecutionReport {
+    tool_call: ToolCall,
+    result: Result<ToolExecutionOutcome>,
+}
+
 fn resolve_model_and_provider(
     configured_model: &str,
     providers: &dyn ProviderResolver,
@@ -512,6 +698,7 @@ pub async fn run_agent_loop(
     http_client: &dyn HttpClient,
     providers: &dyn ProviderResolver,
     tools: &ToolRegistry,
+    workspace_fs: Option<&dyn AgentFileSystem>,
     session: &mut SessionState,
     session_store: Option<&dyn SessionStore>,
     config: &AgentConfig,
@@ -521,6 +708,7 @@ pub async fn run_agent_loop(
         http_client,
         providers,
         tools,
+        workspace_fs,
         session,
         session_store,
         config,
@@ -534,6 +722,7 @@ pub async fn run_agent_loop_with_progress(
     http_client: &dyn HttpClient,
     providers: &dyn ProviderResolver,
     tools: &ToolRegistry,
+    workspace_fs: Option<&dyn AgentFileSystem>,
     session: &mut SessionState,
     session_store: Option<&dyn SessionStore>,
     config: &AgentConfig,
@@ -541,8 +730,16 @@ pub async fn run_agent_loop_with_progress(
     progress: Option<&mut (dyn FnMut(AgentProgressEvent) + Send)>,
 ) -> Result<AgentResult> {
     let progress_emitter = progress.map(ProgressEmitter::new);
-    let custom_agents_all =
-        collect_custom_agents(&session.working_dir, &config.custom_agent_default_model);
+    let custom_agents_all = if config.context_management_policy.include_custom_agents {
+        match workspace_fs {
+            Some(file_system) => {
+                collect_custom_agents_from_fs(file_system, &config.custom_agent_default_model).await
+            }
+            None => collect_custom_agents(&session.working_dir, &config.custom_agent_default_model),
+        }
+    } else {
+        Vec::new()
+    };
     let mut effective_config = config.clone();
     let mut effective_user_message = user_message.to_string();
     let mut effective_provider_name = providers.default_provider_name().to_string();
@@ -648,11 +845,23 @@ pub async fn run_agent_loop_with_progress(
                 "User initiated agent loop"
             );
 
-            let mut effective_system_prompt = build_effective_system_prompt(
-                &effective_config.system_prompt,
-                &session.working_dir,
-                &custom_agents,
-            );
+            let mut effective_system_prompt = match workspace_fs {
+                Some(file_system) => {
+                    build_effective_system_prompt_from_fs(
+                        &effective_config.system_prompt,
+                        file_system,
+                        &custom_agents,
+                        &effective_config.context_management_policy,
+                    )
+                    .await
+                }
+                None => build_effective_system_prompt(
+                    &effective_config.system_prompt,
+                    &session.working_dir,
+                    &custom_agents,
+                    &effective_config.context_management_policy,
+                ),
+            };
             if let Some(allowed) = &allowed_runtime_tools {
                 let resolved_runtime_tools = allowed.resolve_allowed_names(tools.tool_names());
                 effective_system_prompt.push_str("\n\n# Available Runtime Tools\n");
@@ -755,7 +964,7 @@ pub async fn run_agent_loop_with_progress(
 
                     async {
                         // Call the model provider.
-                        let llm_start = Instant::now();
+                        let llm_start = Stopwatch::start_new();
                         let http_req = active_provider.build_http_request(&request)?;
                         emit_progress_event(
                             progress_emitter,
@@ -777,7 +986,7 @@ pub async fn run_agent_loop_with_progress(
                         info!("→ Model request");
 
                         let http_resp = http_client.send(http_req).await?;
-                        let llm_latency_ms = llm_start.elapsed().as_millis() as u64;
+                        let llm_latency_ms = llm_start.elapsed_ms();
                         let response_payload =
                             serde_json::from_str::<serde_json::Value>(&http_resp.body)
                                 .unwrap_or_else(|_| {
@@ -935,10 +1144,34 @@ pub async fn run_agent_loop_with_progress(
                         info!(content = %text, "Assistant (thinking)");
                     }
 
-                    // Execute each tool call
+                    // Execute tool calls concurrently, then append their results in the
+                    // original model-specified order for a deterministic next turn.
+                    let tool_runs = tool_calls.iter().map(|tc| {
+                        let tool_call = tc.clone();
+                        async {
+                            let result = execute_tool_call(
+                                http_client,
+                                providers,
+                                tools,
+                                workspace_fs,
+                                &tool_call,
+                                effective_config.max_tool_output_chars,
+                                &custom_agent_tools,
+                                allowed_runtime_tools.as_ref(),
+                                &handoff_defaults_by_tool,
+                                progress_emitter,
+                                &effective_config,
+                                &effective_provider_name,
+                                &session.working_dir,
+                                session_store,
+                                &session.meta.id,
+                            )
+                            .await;
+                            ToolCallExecutionReport { tool_call, result }
+                        }
+                    });
                     for tc in &tool_calls {
                         total_tool_calls += 1;
-                        let is_handoff_tool_call = custom_agent_tools.contains_key(&tc.function.name);
                         emit_progress_event(
                             progress_emitter,
                             session_store,
@@ -946,30 +1179,29 @@ pub async fn run_agent_loop_with_progress(
                             AgentProgressEvent::ToolCallStarted {
                                 agent: active_agent_name.clone(),
                                 handoff_depth: effective_config.handoff_depth,
+                                tool_call_id: tc.id.clone(),
                                 tool_name: tc.function.name.clone(),
                                 arguments: tc.function.arguments.clone(),
                             },
                         )
                         .await;
-                        let tool_result = execute_tool_call(
-                            http_client,
-                            providers,
-                            tools,
-                            tc,
-                            effective_config.max_tool_output_chars,
-                            &custom_agent_tools,
-                            allowed_runtime_tools.as_ref(),
-                            &handoff_defaults_by_tool,
-                            progress_emitter,
-                            &effective_config,
-                            &effective_provider_name,
-                            &session.working_dir,
-                            session_store,
-                            &session.meta.id,
-                        )
-                        .await;
+                    }
 
-                        let result_str = match &tool_result {
+                    let mut completed_tool_runs = HashMap::with_capacity(tool_calls.len());
+                    for report in join_all(tool_runs).await {
+                        completed_tool_runs.insert(report.tool_call.id.clone(), report);
+                    }
+
+                    for tc in &tool_calls {
+                        let report = completed_tool_runs.remove(&tc.id).ok_or_else(|| {
+                            crate::Error::custom(format!(
+                                "Missing completed result for tool call '{}'",
+                                tc.id
+                            ))
+                        })?;
+                        let is_handoff_tool_call =
+                            custom_agent_tools.contains_key(&report.tool_call.function.name);
+                        let result_str = match &report.result {
                             Ok(outcome) => {
                                 for event in &outcome.forwarded_events {
                                     emit_progress_event(
@@ -980,18 +1212,18 @@ pub async fn run_agent_loop_with_progress(
                                     )
                                     .await;
                                 }
-                                // Record tool execution
-                                let args: serde_json::Value =
-                                    serde_json::from_str(&tc.function.arguments)
-                                        .unwrap_or(serde_json::Value::Null);
+                                let args: serde_json::Value = serde_json::from_str(
+                                    &report.tool_call.function.arguments,
+                                )
+                                .unwrap_or(serde_json::Value::Null);
                                 let tool_execution = ToolExecutionRecord {
-                                    id: tc.id.clone(),
-                                    tool_name: tc.function.name.clone(),
+                                    id: report.tool_call.id.clone(),
+                                    tool_name: report.tool_call.function.name.clone(),
                                     arguments: args,
                                     result: outcome.output.clone(),
                                     success: true,
                                     latency_ms: outcome.latency_ms,
-                                    created_at: Utc::now(),
+                                    created_at: utc_now(),
                                 };
                                 session.record_tool_execution(tool_execution.clone());
                                 total_cost_usd += outcome.delegated_cost_usd;
@@ -1004,7 +1236,8 @@ pub async fn run_agent_loop_with_progress(
                                     AgentProgressEvent::ToolCallFinished {
                                         agent: active_agent_name.clone(),
                                         handoff_depth: effective_config.handoff_depth,
-                                        tool_name: tc.function.name.clone(),
+                                        tool_call_id: report.tool_call.id.clone(),
+                                        tool_name: report.tool_call.function.name.clone(),
                                         success: true,
                                         latency_ms: outcome.latency_ms,
                                         result: outcome.output.clone(),
@@ -1017,7 +1250,7 @@ pub async fn run_agent_loop_with_progress(
                                     &active_agent_name,
                                     effective_config.handoff_depth,
                                     Some(turn),
-                                    &Message::tool_result(&tc.id, &outcome.output),
+                                    &Message::tool_result(&report.tool_call.id, &outcome.output),
                                     &tool_execution,
                                 )
                                 .await;
@@ -1025,17 +1258,18 @@ pub async fn run_agent_loop_with_progress(
                             }
                             Err(e) => {
                                 let err_msg = format!("Error: {e}");
-                                let args: serde_json::Value =
-                                    serde_json::from_str(&tc.function.arguments)
-                                        .unwrap_or(serde_json::Value::Null);
+                                let args: serde_json::Value = serde_json::from_str(
+                                    &report.tool_call.function.arguments,
+                                )
+                                .unwrap_or(serde_json::Value::Null);
                                 let tool_execution = ToolExecutionRecord {
-                                    id: tc.id.clone(),
-                                    tool_name: tc.function.name.clone(),
+                                    id: report.tool_call.id.clone(),
+                                    tool_name: report.tool_call.function.name.clone(),
                                     arguments: args,
                                     result: err_msg.clone(),
                                     success: false,
                                     latency_ms: 0,
-                                    created_at: Utc::now(),
+                                    created_at: utc_now(),
                                 };
                                 session.record_tool_execution(tool_execution.clone());
                                 emit_progress_event(
@@ -1045,7 +1279,8 @@ pub async fn run_agent_loop_with_progress(
                                     AgentProgressEvent::ToolCallFinished {
                                         agent: active_agent_name.clone(),
                                         handoff_depth: effective_config.handoff_depth,
-                                        tool_name: tc.function.name.clone(),
+                                        tool_call_id: report.tool_call.id.clone(),
+                                        tool_name: report.tool_call.function.name.clone(),
                                         success: false,
                                         latency_ms: 0,
                                         result: err_msg.clone(),
@@ -1058,7 +1293,7 @@ pub async fn run_agent_loop_with_progress(
                                     &active_agent_name,
                                     effective_config.handoff_depth,
                                     Some(turn),
-                                    &Message::tool_result(&tc.id, &err_msg),
+                                    &Message::tool_result(&report.tool_call.id, &err_msg),
                                     &tool_execution,
                                 )
                                 .await;
@@ -1066,15 +1301,14 @@ pub async fn run_agent_loop_with_progress(
                             }
                         };
 
-                        // Add tool result message to conversation
                         if is_handoff_tool_call {
                             let handoff_visibility_span = tracing::trace_span!(
                                 target: "zagent::handoff_visibility",
                                 "handoff_visibility",
                                 parent_agent = %active_agent_name,
                                 parent_handoff_depth = effective_config.handoff_depth,
-                                handoff_tool = %tc.function.name,
-                                tool_call_id = %tc.id,
+                                handoff_tool = %report.tool_call.function.name,
+                                tool_call_id = %report.tool_call.id,
                                 output_len = result_str.len()
                             );
                             let _handoff_visibility_guard = handoff_visibility_span.enter();
@@ -1084,7 +1318,7 @@ pub async fn run_agent_loop_with_progress(
                                 "Parent agent consumed handoff output and appended it as a tool_result message for the next model turn"
                             );
                         }
-                        let tool_msg = Message::tool_result(&tc.id, &result_str);
+                        let tool_msg = Message::tool_result(&report.tool_call.id, &result_str);
                         session.add_message(tool_msg);
                     }
 
@@ -1187,6 +1421,7 @@ async fn execute_tool_call(
     http_client: &dyn HttpClient,
     providers: &dyn ProviderResolver,
     tools: &ToolRegistry,
+    workspace_fs: Option<&dyn AgentFileSystem>,
     tool_call: &ToolCall,
     max_output_chars: usize,
     custom_agent_tools: &HashMap<String, CustomAgentDefinition>,
@@ -1281,6 +1516,7 @@ async fn execute_tool_call(
                 max_turns: parent_config.max_turns,
                 max_tool_output_chars: parent_config.max_tool_output_chars,
                 system_prompt: child_prompt,
+                context_management_policy: parent_config.context_management_policy.clone(),
                 active_custom_agent_id: Some(child_agent.id.clone()),
                 handoff_depth: parent_config.handoff_depth.saturating_add(1),
                 visible_mcp_tools: parent_config.visible_mcp_tools.clone(),
@@ -1313,7 +1549,7 @@ async fn execute_tool_call(
                 working_dir.to_string(),
             );
 
-            let start = Instant::now();
+            let start = Stopwatch::start_new();
             let mut child_events = Vec::new();
             let persist_child_events_inline = parent_session_store.is_some();
             let mut child_progress = |event: AgentProgressEvent| {
@@ -1333,6 +1569,7 @@ async fn execute_tool_call(
                     http_client,
                     providers,
                     tools,
+                    workspace_fs,
                     &mut child_session,
                     forwarding_store
                         .as_ref()
@@ -1345,7 +1582,7 @@ async fn execute_tool_call(
             }
             .instrument(handoff_span)
             .await?;
-            let latency_ms = start.elapsed().as_millis() as u64;
+            let latency_ms = start.elapsed_ms();
 
             let output = format!(
                 "{}\n\n[handoff agent={} turns={} tools={} prompt_tokens={} completion_tokens={} cached_prompt_tokens={} cost_usd={:.6}]",
@@ -1369,6 +1606,17 @@ async fn execute_tool_call(
 
         let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
             .map_err(|e| crate::Error::tool(tool_name, format!("Invalid JSON arguments: {e}")))?;
+        let mut args = args;
+        if let Some(obj) = args.as_object_mut() {
+            obj.insert(
+                "_zagent_tool_call_id".to_string(),
+                serde_json::Value::String(tool_call.id.clone()),
+            );
+            obj.insert(
+                "_zagent_session_id".to_string(),
+                serde_json::Value::String(parent_session_id.to_string()),
+            );
+        }
         if let Some(allowed) = allowed_runtime_tools
             && !allowed.allows(tool_name)
         {
@@ -1383,7 +1631,7 @@ async fn execute_tool_call(
             "⚡ Tool call"
         );
 
-        let start = Instant::now();
+        let start = Stopwatch::start_new();
         let result = match tools.execute(tool_name, args).await {
             Ok(result) => result,
             Err(e) => {
@@ -1391,7 +1639,7 @@ async fn execute_tool_call(
                 return Err(e);
             }
         };
-        let latency_ms = start.elapsed().as_millis() as u64;
+        let latency_ms = start.elapsed_ms();
 
         // Truncate output for display/logging if too large
         let display_result = if result.chars().count() > max_output_chars {
@@ -1522,6 +1770,7 @@ fn progress_event_to_session_event(session_id: &str, event: &AgentProgressEvent)
         AgentProgressEvent::ToolCallStarted {
             agent,
             handoff_depth,
+            tool_call_id,
             tool_name,
             arguments,
         } => {
@@ -1533,21 +1782,25 @@ fn progress_event_to_session_event(session_id: &str, event: &AgentProgressEvent)
                 None,
                 serde_json::json!({
                     "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
                     "arguments": arguments,
                     "json_detail": {
                         "tool_name": tool_name,
+                        "tool_call_id": tool_call_id,
                         "arguments": arguments
                     }
                 }),
             );
             event.phase = Some("start".to_string());
             event.tool_name = Some(tool_name.clone());
+            event.tool_call_id = Some(tool_call_id.clone());
             event.arguments = Some(arguments.clone());
             event
         }
         AgentProgressEvent::ToolCallFinished {
             agent,
             handoff_depth,
+            tool_call_id,
             tool_name,
             success,
             latency_ms,
@@ -1561,11 +1814,13 @@ fn progress_event_to_session_event(session_id: &str, event: &AgentProgressEvent)
                 None,
                 serde_json::json!({
                     "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
                     "success": success,
                     "latency_ms": latency_ms,
                     "result": result,
                     "json_detail": {
                         "tool_name": tool_name,
+                        "tool_call_id": tool_call_id,
                         "success": success,
                         "latency_ms": latency_ms,
                         "result": result
@@ -1574,6 +1829,7 @@ fn progress_event_to_session_event(session_id: &str, event: &AgentProgressEvent)
             );
             event.phase = Some("finish".to_string());
             event.tool_name = Some(tool_name.clone());
+            event.tool_call_id = Some(tool_call_id.clone());
             event.success = Some(*success);
             event.latency_ms = Some(*latency_ms);
             event.result = Some(result.clone());
@@ -1752,12 +2008,23 @@ fn extract_credits_remaining(headers: &[(String, String)]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{Provider, StaticProviderResolver};
+    use crate::fs::{AgentFileSystem, FileSystemEntry};
+    use crate::provider::types::{ChatRequest, ChatResponse, Choice, FunctionCall};
+    use crate::provider::{
+        HttpClient, HttpRequest, HttpResponse, Provider, StaticProviderResolver,
+    };
+    use crate::tools::{Tool, ToolRegistry};
     use async_trait::async_trait;
+    use serde_json::json;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::time::sleep;
 
     struct TestProvider {
         name: &'static str,
@@ -1775,6 +2042,197 @@ mod tests {
 
         fn api_key(&self) -> &str {
             "test-key"
+        }
+    }
+
+    struct TestHttpClient {
+        requests: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl HttpClient for TestHttpClient {
+        async fn send(&self, request: HttpRequest) -> Result<HttpResponse> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            let chat_request: ChatRequest =
+                serde_json::from_str(request.body.as_deref().unwrap_or("{}"))?;
+            let tool_results = chat_request
+                .messages
+                .iter()
+                .filter(|msg| msg.role == crate::provider::types::Role::Tool)
+                .count();
+
+            let response = if tool_results >= 2 {
+                ChatResponse {
+                    id: Some("resp-final".to_string()),
+                    choices: vec![Choice {
+                        index: 0,
+                        message: Message::assistant("parallel tools complete"),
+                        finish_reason: Some("stop".to_string()),
+                    }],
+                    usage: None,
+                    model: Some(chat_request.model),
+                }
+            } else {
+                ChatResponse {
+                    id: Some("resp-tools".to_string()),
+                    choices: vec![Choice {
+                        index: 0,
+                        message: Message::assistant_with_tool_calls(
+                            None,
+                            vec![
+                                ToolCall {
+                                    id: "call_one".to_string(),
+                                    call_type: "function".to_string(),
+                                    function: FunctionCall {
+                                        name: "sleep_one".to_string(),
+                                        arguments: "{}".to_string(),
+                                    },
+                                },
+                                ToolCall {
+                                    id: "call_two".to_string(),
+                                    call_type: "function".to_string(),
+                                    function: FunctionCall {
+                                        name: "sleep_two".to_string(),
+                                        arguments: "{}".to_string(),
+                                    },
+                                },
+                            ],
+                        ),
+                        finish_reason: Some("tool_calls".to_string()),
+                    }],
+                    usage: None,
+                    model: Some(chat_request.model),
+                }
+            };
+
+            Ok(HttpResponse {
+                status: 200,
+                body: serde_json::to_string(&response)?,
+                headers: Vec::new(),
+            })
+        }
+    }
+
+    struct SleepTool {
+        name: &'static str,
+        delay: Duration,
+    }
+
+    #[derive(Default)]
+    struct TestMemoryFileSystem {
+        files: BTreeMap<String, String>,
+        dirs: BTreeSet<String>,
+    }
+
+    impl TestMemoryFileSystem {
+        fn from_files<const N: usize>(files: [(&str, &str); N]) -> Self {
+            let mut this = Self::default();
+            this.dirs.insert(String::new());
+            for (path, content) in files {
+                this.insert_file(path, content);
+            }
+            this
+        }
+
+        fn insert_file(&mut self, path: &str, content: &str) {
+            self.files.insert(path.to_string(), content.to_string());
+            let mut parts = Vec::new();
+            for part in path.split('/') {
+                parts.push(part);
+                if parts.len() < path.split('/').count() {
+                    self.dirs.insert(parts.join("/"));
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgentFileSystem for TestMemoryFileSystem {
+        async fn read_to_string(&self, path: &str) -> Result<String> {
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| crate::Error::custom(format!("missing path: {path}")))
+        }
+
+        async fn write_string(&self, _path: &str, _content: &str) -> Result<()> {
+            Err(crate::Error::custom("not implemented in tests"))
+        }
+
+        async fn list_dir(
+            &self,
+            path: &str,
+            recursive: bool,
+            max_depth: usize,
+        ) -> Result<Vec<FileSystemEntry>> {
+            let prefix = match path {
+                "." | "" => String::new(),
+                other => format!("{other}/"),
+            };
+            let mut out = Vec::new();
+
+            for dir in &self.dirs {
+                if dir.is_empty() || !dir.starts_with(&prefix) {
+                    continue;
+                }
+                let relative = dir.strip_prefix(&prefix).unwrap_or(dir);
+                let depth = relative.matches('/').count();
+                if (!recursive && depth > 0) || depth > max_depth || relative.is_empty() {
+                    continue;
+                }
+                let name = relative.rsplit('/').next().unwrap_or(relative).to_string();
+                out.push(FileSystemEntry {
+                    path: dir.clone(),
+                    name,
+                    is_dir: true,
+                    size: 0,
+                    depth,
+                });
+            }
+
+            for (file_path, content) in &self.files {
+                if !file_path.starts_with(&prefix) {
+                    continue;
+                }
+                let relative = file_path.strip_prefix(&prefix).unwrap_or(file_path);
+                let depth = relative.matches('/').count();
+                if (!recursive && depth > 0) || depth > max_depth {
+                    continue;
+                }
+                let name = relative.rsplit('/').next().unwrap_or(relative).to_string();
+                out.push(FileSystemEntry {
+                    path: file_path.clone(),
+                    name,
+                    is_dir: false,
+                    size: content.len() as u64,
+                    depth,
+                });
+            }
+
+            Ok(out)
+        }
+    }
+
+    #[async_trait]
+    impl Tool for SleepTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Sleep for a short duration"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": {},
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> Result<String> {
+            sleep(self.delay).await;
+            Ok(format!("{} done", self.name))
         }
     }
 
@@ -1826,6 +2284,8 @@ Use this skill when doing multi-file Rust cleanup.
         let cwd = make_temp_dir("prompt");
         fs::write(cwd.join(AGENTS_FILE_NAME), "Root rule: keep diffs small.\n")
             .expect("write agents file");
+        fs::write(cwd.join(RULES_FILE_NAME), "Rules file: run tests before finishing.\n")
+            .expect("write rules file");
         let skill_dir = cwd.join("skills").join("release");
         fs::create_dir_all(&skill_dir).expect("create skill dir");
         fs::write(
@@ -1834,13 +2294,78 @@ Use this skill when doing multi-file Rust cleanup.
         )
         .expect("write skill file");
 
-        let prompt =
-            build_effective_system_prompt("Base prompt", cwd.to_str().expect("cwd utf8"), &[]);
+        let prompt = build_effective_system_prompt(
+            "Base prompt",
+            cwd.to_str().expect("cwd utf8"),
+            &[],
+            &ContextManagementPolicy::default(),
+        );
         assert!(prompt.contains("# Rules"));
         assert!(prompt.contains("Root rule: keep diffs small."));
+        assert!(prompt.contains("Rules file: run tests before finishing."));
         assert!(prompt.contains("# Available Skills"));
         assert!(prompt.contains("release: Release Skill [source: skills/release/SKILL.md]"));
         assert!(prompt.contains("only read a skill with file_read"));
+
+        fs::remove_dir_all(cwd).expect("remove temp dir");
+    }
+
+    #[test]
+    fn context_policy_can_disable_workspace_catalogs() {
+        let cwd = make_temp_dir("prompt-policy");
+        fs::write(cwd.join(AGENTS_FILE_NAME), "Root rule: keep diffs small.\n")
+            .expect("write agents file");
+        let skill_dir = cwd.join("skills").join("release");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join(SKILL_FILE_NAME),
+            "# Release Skill\nFollow the release checklist.\n",
+        )
+        .expect("write skill file");
+
+        let prompt = build_effective_system_prompt(
+            "Base prompt",
+            cwd.to_str().expect("cwd utf8"),
+            &[],
+            &ContextManagementPolicy {
+                include_agents_md: false,
+                include_rules_md: false,
+                include_skills: false,
+                include_custom_agents: false,
+            },
+        );
+        assert_eq!(prompt, "Base prompt");
+
+        fs::remove_dir_all(cwd).expect("remove temp dir");
+    }
+
+    #[tokio::test]
+    async fn injected_workspace_filesystem_hides_host_agents_files() {
+        let cwd = make_temp_dir("workspace-host-leak");
+        fs::write(
+            cwd.join(AGENTS_FILE_NAME),
+            "Host rule: should stay hidden.\n",
+        )
+        .expect("write host agents file");
+
+        let memory_fs = TestMemoryFileSystem::from_files([
+            ("AGENTS.md", "VFS rule: visible.\n"),
+            (
+                "skills/release/SKILL.md",
+                "# Release Skill\nVisible from VFS.\n",
+            ),
+        ]);
+
+        let prompt = build_effective_system_prompt_from_fs(
+            "Base prompt",
+            &memory_fs,
+            &[],
+            &ContextManagementPolicy::default(),
+        )
+        .await;
+        assert!(prompt.contains("VFS rule: visible."));
+        assert!(prompt.contains("skills/release/SKILL.md"));
+        assert!(!prompt.contains("Host rule: should stay hidden."));
 
         fs::remove_dir_all(cwd).expect("remove temp dir");
     }
@@ -1883,5 +2408,75 @@ Use this skill when doing multi-file Rust cleanup.
             err.to_string()
                 .contains("Provider 'openrouter' is not configured")
         );
+    }
+
+    #[tokio::test]
+    async fn executes_tool_batches_concurrently_and_preserves_order() {
+        let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        providers.insert(
+            "openai".to_string(),
+            Arc::new(TestProvider { name: "openai" }),
+        );
+        let resolver = StaticProviderResolver::new("openai", &providers);
+        let http_client = TestHttpClient {
+            requests: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(SleepTool {
+            name: "sleep_one",
+            delay: Duration::from_millis(180),
+        }));
+        tools.register(Box::new(SleepTool {
+            name: "sleep_two",
+            delay: Duration::from_millis(180),
+        }));
+
+        let cwd = make_temp_dir("parallel-tools");
+        let mut session = SessionState::new(
+            "test",
+            "test-model",
+            "openai",
+            "system",
+            cwd.to_string_lossy().to_string(),
+        );
+        let config = AgentConfig {
+            model: "test-model".to_string(),
+            max_turns: 4,
+            ..AgentConfig::default()
+        };
+
+        let start = Stopwatch::start_new();
+        let result = run_agent_loop(
+            &http_client,
+            &resolver,
+            &tools,
+            None,
+            &mut session,
+            None,
+            &config,
+            "run both tools",
+        )
+        .await
+        .expect("agent loop should succeed");
+        let elapsed_ms = start.elapsed_ms();
+
+        assert_eq!(result.tool_calls_count, 2);
+        assert_eq!(result.response, "parallel tools complete");
+        assert!(
+            elapsed_ms < 320,
+            "expected concurrent execution, elapsed_ms = {elapsed_ms}"
+        );
+
+        let tool_messages: Vec<_> = session
+            .messages
+            .iter()
+            .filter(|msg| msg.role == crate::provider::types::Role::Tool)
+            .collect();
+        assert_eq!(tool_messages.len(), 2);
+        assert_eq!(tool_messages[0].tool_call_id.as_deref(), Some("call_one"));
+        assert_eq!(tool_messages[1].tool_call_id.as_deref(), Some("call_two"));
+
+        fs::remove_dir_all(cwd).expect("remove temp dir");
     }
 }

@@ -1,12 +1,18 @@
 use api::{
     normalize_base_url, BackendSnapshot, ConversationLine, ModelEventDetail,
-    ModelEventDetailsSnapshot, ProxyClient, StreamChunk, UiEvent,
+    ModelEventDetailsSnapshot, ProxyClient, StreamChunk, TranscribeResponse, UiEvent,
 };
 use dioxus::prelude::*;
+use dioxus::web::WebEventExt;
 use serde::{Deserialize, Serialize};
-use ui::{AgentNodeView, ChatTurnView, Dashboard, FooterTotalsView, ServerTabView};
+use std::cell::RefCell;
+use std::rc::Rc;
+use ui::{
+    AgentNodeView, ChatTurnView, Dashboard, FooterTotalsView, PromptImagePreviewView, ServerTabView,
+};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
 
 const MAIN_CSS: Asset = asset!("/assets/main.css");
 const HLJS_THEME: &str =
@@ -14,8 +20,7 @@ const HLJS_THEME: &str =
 const HLJS_SCRIPT: &str =
     "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js";
 const STORAGE_KEY: &str = "zagent.dioxus.servers.v1";
-const MERMAID_CSS: &str = "https://cdnjs.cloudflare.com/ajax/libs/mermaid/11.4.1/mermaid.min.css";
-const MERMAID_JS: &str = "https://cdnjs.cloudflare.com/ajax/libs/mermaid/11.4.1/mermaid.min.js";
+const MERMAID_JS: &str = "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js";
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8787";
 
 #[derive(Debug, Clone)]
@@ -33,6 +38,10 @@ struct ServerSession {
     label: String,
     client: ProxyClient,
     prompt: String,
+    prompt_images: Vec<PromptImageAttachment>,
+    next_prompt_image_id: usize,
+    recording: bool,
+    transcribing: bool,
     pending: bool,
     connected: bool,
     status_text: String,
@@ -88,11 +97,32 @@ struct AgentNode {
 
 #[derive(Debug, Clone)]
 struct AgentTimelineEntry {
-    text: String,
+    group_key: String,
+    title: String,
+    request_text: String,
+    response_text: Option<String>,
     kind: String,
     phase: String,
     sequence: Option<u64>,
-    event_id: Option<String>,
+    request_event_id: Option<String>,
+    response_event_id: Option<String>,
+    tool_call_id: Option<String>,
+    running: bool,
+    show_terminal: bool,
+    terminal_segments: Vec<TerminalSegment>,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalSegment {
+    channel: String,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct PromptImageAttachment {
+    id: usize,
+    name: String,
+    preview_url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +136,15 @@ struct PendingHandoff {
 struct StreamHandle {
     server_id: usize,
     source: web_sys::EventSource,
+}
+
+struct RecorderHandle {
+    stream: web_sys::MediaStream,
+    context: web_sys::AudioContext,
+    source: web_sys::MediaStreamAudioSourceNode,
+    processor: web_sys::ScriptProcessorNode,
+    samples: Rc<RefCell<Vec<f32>>>,
+    _on_audio: Closure<dyn FnMut(web_sys::AudioProcessingEvent)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -123,6 +162,7 @@ fn App() -> Element {
     let mut app = use_signal(initial_state);
     let streams = use_signal(|| Vec::<StreamHandle>::new());
     let mut booted = use_signal(|| false);
+    let recorder_handle = use_hook(|| Rc::new(RefCell::new(None::<RecorderHandle>)));
 
     if !booted() {
         booted.set(true);
@@ -156,8 +196,6 @@ fn App() -> Element {
         document::Stylesheet { href: MAIN_CSS }
         document::Stylesheet { href: HLJS_THEME }
         document::Script { src: HLJS_SCRIPT }
-        document::Stylesheet { href: MERMAID_CSS }
-        document::Script { src: MERMAID_JS }
         Dashboard {
             title: "zAgent Dioxus".to_string(),
             status_text: current
@@ -166,9 +204,19 @@ fn App() -> Element {
                 .unwrap_or_else(|| "No server selected".to_string()),
             connected: current.as_ref().is_some_and(|s| s.connected),
             pending: current.as_ref().is_some_and(|s| s.pending),
+            recording: current.as_ref().is_some_and(|s| s.recording),
+            transcribing: current.as_ref().is_some_and(|s| s.transcribing),
             prompt_value: current
                 .as_ref()
                 .map(|s| s.prompt.clone())
+                .unwrap_or_default(),
+            prompt_images: current
+                .as_ref()
+                .map(|s| s.prompt_images.iter().map(|image| PromptImagePreviewView {
+                    id: image.id,
+                    name: image.name.clone(),
+                    data_url: image.preview_url.clone()
+                }).collect())
                 .unwrap_or_default(),
             turns: current
                 .as_ref()
@@ -252,14 +300,39 @@ fn App() -> Element {
                     server.prompt = value;
                 }
             },
+            on_copy_prompt: Some(EventHandler::new(move |_| {
+                if let Some(server) = current_server(&app()) {
+                    copy_to_clipboard(server.prompt);
+                }
+            })),
+            on_paste_prompt: Some(EventHandler::new(move |_| {
+                paste_from_clipboard(app);
+            })),
+            on_prompt_paste: Some(EventHandler::new(move |evt| {
+                handle_prompt_paste(app, evt);
+            })),
+            on_pick_images: Some(EventHandler::new(move |_| {
+                trigger_prompt_image_picker();
+            })),
+            on_remove_prompt_image: move |image_id| {
+                if let Some(server) = current_server_mut(&mut app.write()) {
+                    if let Some(pos) = server.prompt_images.iter().position(|image| image.id == image_id) {
+                        revoke_preview_url(&server.prompt_images[pos].preview_url);
+                        server.prompt_images.remove(pos);
+                    }
+                }
+            },
+            on_toggle_recording: Some(EventHandler::new(move |_| {
+                toggle_recording(app, recorder_handle.clone());
+            })),
             on_submit: move |_| {
                 let (server_id, client, text) = {
                     let mut state = app.write();
                     let Some(server) = current_server_mut(&mut state) else {
                         return;
                     };
-                    let text = server.prompt.trim().to_string();
-                    if text.is_empty() || server.pending {
+                    let text = compose_prompt_submission(server);
+                    if text.is_empty() || server.pending || server.transcribing {
                         return;
                     }
                     server.pending = true;
@@ -269,6 +342,7 @@ fn App() -> Element {
                     append_user_turn_if_new(server, &text);
                     begin_streaming_response(server);
                     server.prompt.clear();
+                    clear_prompt_images(server);
                     (server.id, server.client.clone(), text)
                 };
 
@@ -361,6 +435,16 @@ fn App() -> Element {
                 });
             }
         }
+        input {
+            id: "prompt-image-picker",
+            r#type: "file",
+            accept: "image/*",
+            multiple: true,
+            hidden: true,
+            onchange: move |evt| {
+                handle_prompt_image_selection(app, evt);
+            }
+        }
         if current
             .as_ref()
             .is_some_and(|server| server.model_json_dialog_open)
@@ -449,16 +533,63 @@ fn highlight_markdown_code() {
 }
 
 fn render_mermaid_diagrams() {
-    // Initialize mermaid if not already done, then render any mermaid diagrams
-    let _ = js_sys::eval(
-        "if (window.mermaid) { \
-            if (!window.mermaidInitialized) { \
-                window.mermaid.initialize({ startOnLoad: false }); \
-                window.mermaidInitialized = true; \
-            } \
-            window.mermaid.run({ querySelector: '.mermaid' }); \
-        }",
+    let script = format!(
+        "(function () {{ \
+            const scriptSrc = {script_src:?}; \
+            window.__zagentRenderMermaid = async function () {{ \
+                if (!window.mermaid) {{ \
+                    let script = document.querySelector('script[data-zagent-mermaid-script]'); \
+                    if (!script) {{ \
+                        script = document.createElement('script'); \
+                        script.src = scriptSrc; \
+                        script.async = true; \
+                        script.dataset.zagentMermaidScript = 'true'; \
+                        script.onload = function () {{ \
+                            if (window.__zagentRenderMermaid) {{ \
+                                window.__zagentRenderMermaid(); \
+                            }} \
+                        }}; \
+                        script.onerror = function () {{ \
+                            document.querySelectorAll('.mermaid-graph:not([data-mermaid-rendered])').forEach((node) => {{ \
+                                node.setAttribute('data-mermaid-rendered', 'error'); \
+                                node.setAttribute('data-mermaid-error', 'Failed to load Mermaid script'); \
+                            }}); \
+                        }}; \
+                        document.head.appendChild(script); \
+                    }} \
+                    return; \
+                }} \
+                if (!window.mermaidInitialized) {{ \
+                    window.mermaid.initialize({{ startOnLoad: false, securityLevel: 'loose' }}); \
+                    window.mermaidInitialized = true; \
+                }} \
+                const nodes = document.querySelectorAll('.mermaid-graph:not([data-mermaid-rendered])'); \
+                for (const node of nodes) {{ \
+                    const source = (node.textContent || '').trim(); \
+                    if (!source) {{ \
+                        node.setAttribute('data-mermaid-rendered', 'empty'); \
+                        continue; \
+                    }} \
+                    try {{ \
+                        const id = 'zagent-mermaid-' + Math.random().toString(36).slice(2); \
+                        const rendered = await window.mermaid.render(id, source); \
+                        node.innerHTML = rendered.svg; \
+                        node.setAttribute('data-mermaid-rendered', 'true'); \
+                        if (rendered.bindFunctions) {{ \
+                            rendered.bindFunctions(node); \
+                        }} \
+                    }} catch (err) {{ \
+                        console.error('Failed to render mermaid diagram', err); \
+                        node.setAttribute('data-mermaid-rendered', 'error'); \
+                        node.setAttribute('data-mermaid-error', String(err)); \
+                    }} \
+                }} \
+            }}; \
+            window.__zagentRenderMermaid(); \
+        }})();",
+        script_src = MERMAID_JS,
     );
+    let _ = js_sys::eval(&script);
 }
 
 fn initial_state() -> AppState {
@@ -523,6 +654,10 @@ fn new_server_session(id: usize, base_url: &str) -> ServerSession {
         label: server_label(id, &client.base_url),
         client,
         prompt: String::new(),
+        prompt_images: Vec::new(),
+        next_prompt_image_id: 0,
+        recording: false,
+        transcribing: false,
         pending: false,
         connected: false,
         status_text: "connecting...".to_string(),
@@ -559,6 +694,340 @@ fn server_label(id: usize, base_url: &str) -> String {
         .next()
         .unwrap_or(base_url);
     format!("S{} {}", id + 1, host)
+}
+
+fn trigger_prompt_image_picker() {
+    let document = web_sys::window().and_then(|w| w.document());
+    let Some(input) = document
+        .and_then(|d| d.get_element_by_id("prompt-image-picker"))
+        .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
+    else {
+        return;
+    };
+    input.set_value("");
+    input.click();
+}
+
+fn handle_prompt_image_selection(mut app: Signal<AppState>, evt: Event<FormData>) {
+    let files = evt.files();
+    if files.is_empty() {
+        return;
+    }
+    let active_tab_id = app().active_tab_id;
+    let mut state = app.write();
+    let Some(server) = find_server_mut_by_id(&mut state, active_tab_id) else {
+        return;
+    };
+
+    for file in files {
+        push_prompt_image(
+            server,
+            &file.name(),
+            file.inner().downcast_ref::<web_sys::File>(),
+        );
+    }
+}
+
+fn push_prompt_image(server: &mut ServerSession, name: &str, file: Option<&web_sys::File>) -> bool {
+    let Some(file) = file else {
+        return false;
+    };
+    let Ok(preview_url) = web_sys::Url::create_object_url_with_blob(file) else {
+        return false;
+    };
+    let image_id = server.next_prompt_image_id;
+    server.next_prompt_image_id = server.next_prompt_image_id.saturating_add(1);
+    server.prompt_images.push(PromptImageAttachment {
+        id: image_id,
+        name: name.to_string(),
+        preview_url,
+    });
+    true
+}
+
+fn clear_prompt_images(server: &mut ServerSession) {
+    for image in &server.prompt_images {
+        revoke_preview_url(&image.preview_url);
+    }
+    server.prompt_images.clear();
+}
+
+fn revoke_preview_url(url: &str) {
+    let _ = web_sys::Url::revoke_object_url(url);
+}
+
+fn compose_prompt_submission(server: &ServerSession) -> String {
+    let mut text = server.prompt.trim().to_string();
+    if !server.prompt_images.is_empty() {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str("Attached image previews:\n");
+        for image in &server.prompt_images {
+            text.push_str(&format!("- {}\n", image.name));
+        }
+    }
+    text
+}
+
+fn copy_to_clipboard(text: String) {
+    spawn(async move {
+        let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard()) else {
+            return;
+        };
+        let _ = JsFuture::from(clipboard.write_text(&text)).await;
+    });
+}
+
+fn paste_from_clipboard(app: Signal<AppState>) {
+    spawn(async move {
+        let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard()) else {
+            return;
+        };
+        let Ok(value) = JsFuture::from(clipboard.read_text()).await else {
+            return;
+        };
+        append_prompt_text(app, &value.as_string().unwrap_or_default());
+    });
+}
+
+fn handle_prompt_paste(mut app: Signal<AppState>, evt: dioxus::events::ClipboardEvent) {
+    let Some(web_event) = evt.data().try_as_web_event() else {
+        return;
+    };
+    let Ok(clipboard_event) = web_event.dyn_into::<web_sys::ClipboardEvent>() else {
+        return;
+    };
+    let Some(data) = clipboard_event.clipboard_data() else {
+        return;
+    };
+    let items = data.items();
+    let active_tab_id = app().active_tab_id;
+    let mut state = app.write();
+    let Some(server) = find_server_mut_by_id(&mut state, active_tab_id) else {
+        return;
+    };
+
+    let mut added_image = false;
+    for idx in 0..items.length() {
+        let Some(item) = items.get(idx) else {
+            continue;
+        };
+        if !item.kind().eq_ignore_ascii_case("file") {
+            continue;
+        }
+        let mime = item.type_();
+        if !mime.starts_with("image/") {
+            continue;
+        }
+        let Ok(Some(file)) = item.get_as_file() else {
+            continue;
+        };
+        let name = if file.name().is_empty() {
+            format!("pasted-image-{}.png", server.next_prompt_image_id)
+        } else {
+            file.name()
+        };
+        added_image |= push_prompt_image(server, &name, Some(&file));
+    }
+
+    if added_image {
+        clipboard_event.prevent_default();
+    }
+}
+
+fn append_prompt_text(mut app: Signal<AppState>, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    if let Some(server) = current_server_mut(&mut app.write()) {
+        append_prompt_text_to_server(server, text);
+    }
+}
+
+fn append_prompt_text_to_server(server: &mut ServerSession, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    if server.prompt.trim().is_empty() {
+        server.prompt = text.to_string();
+    } else {
+        server.prompt.push('\n');
+        server.prompt.push_str(text);
+    }
+}
+
+fn toggle_recording(
+    mut app: Signal<AppState>,
+    recorder_handle: Rc<RefCell<Option<RecorderHandle>>>,
+) {
+    let active_tab_id = app().active_tab_id;
+    let Some(current) = current_server(&app()) else {
+        return;
+    };
+    if current.transcribing {
+        return;
+    }
+    if current.recording {
+        if let Some(server) = find_server_mut_by_id(&mut app.write(), active_tab_id) {
+            server.recording = false;
+            server.transcribing = true;
+            server.status_text = "Transcribing voice note...".to_string();
+        }
+        let client = current.client.clone();
+        let handle = recorder_handle.borrow_mut().take();
+        spawn(async move {
+            let Some(handle) = handle else {
+                return;
+            };
+            let wav = finalize_recording(handle).await;
+            let result = client.transcribe_wav(&wav, Some("en")).await;
+            if let Some(server) = find_server_mut_by_id(&mut app.write(), active_tab_id) {
+                server.recording = false;
+                server.transcribing = false;
+                match result {
+                    Ok(TranscribeResponse { text }) => {
+                        append_prompt_text_to_server(server, &text);
+                        server.status_text = "Voice transcription ready".to_string();
+                    }
+                    Err(err) => server.status_text = err,
+                }
+            }
+        });
+        return;
+    }
+
+    if let Some(server) = find_server_mut_by_id(&mut app.write(), active_tab_id) {
+        server.recording = true;
+        server.transcribing = false;
+        server.status_text = "Requesting microphone...".to_string();
+    }
+
+    spawn(async move {
+        match start_recording().await {
+            Ok(handle) => {
+                *recorder_handle.borrow_mut() = Some(handle);
+                if let Some(server) = find_server_mut_by_id(&mut app.write(), active_tab_id) {
+                    server.recording = true;
+                    server.transcribing = false;
+                    server.status_text = "Recording voice note...".to_string();
+                }
+            }
+            Err(err) => {
+                if let Some(server) = find_server_mut_by_id(&mut app.write(), active_tab_id) {
+                    server.recording = false;
+                    server.transcribing = false;
+                    server.status_text = err;
+                }
+            }
+        }
+    });
+}
+
+async fn start_recording() -> Result<RecorderHandle, String> {
+    let navigator = web_sys::window()
+        .map(|w| w.navigator())
+        .ok_or_else(|| "window unavailable".to_string())?;
+    let media_devices = navigator
+        .media_devices()
+        .map_err(|_| "media devices unavailable".to_string())?;
+    let constraints = web_sys::MediaStreamConstraints::new();
+    constraints.set_audio(&wasm_bindgen::JsValue::TRUE);
+    let stream = JsFuture::from(
+        media_devices
+            .get_user_media_with_constraints(&constraints)
+            .map_err(|_| "microphone access failed".to_string())?,
+    )
+    .await
+    .map_err(|_| "microphone access denied".to_string())?
+    .dyn_into::<web_sys::MediaStream>()
+    .map_err(|_| "invalid media stream".to_string())?;
+
+    let context = web_sys::AudioContext::new().map_err(|_| "audio context failed".to_string())?;
+    let source = context
+        .create_media_stream_source(&stream)
+        .map_err(|_| "audio source failed".to_string())?;
+    let processor = context
+        .create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(
+            4096, 1, 1,
+        )
+        .map_err(|_| "audio processor failed".to_string())?;
+    let samples = Rc::new(RefCell::new(Vec::<f32>::new()));
+    let samples_for_cb = samples.clone();
+    let on_audio = Closure::wrap(Box::new(move |event: web_sys::AudioProcessingEvent| {
+        let Ok(buffer) = event.input_buffer() else {
+            return;
+        };
+        let Ok(channel) = buffer.get_channel_data(0) else {
+            return;
+        };
+        samples_for_cb.borrow_mut().extend(channel);
+    }) as Box<dyn FnMut(_)>);
+
+    processor.set_onaudioprocess(Some(on_audio.as_ref().unchecked_ref()));
+    source
+        .connect_with_audio_node(&processor)
+        .map_err(|_| "audio graph connect failed".to_string())?;
+    processor
+        .connect_with_audio_node(&context.destination())
+        .map_err(|_| "audio graph output failed".to_string())?;
+
+    Ok(RecorderHandle {
+        stream,
+        context,
+        source,
+        processor,
+        samples,
+        _on_audio: on_audio,
+    })
+}
+
+async fn finalize_recording(handle: RecorderHandle) -> Vec<u8> {
+    let _ = handle.source.disconnect();
+    let _ = handle.processor.disconnect();
+    handle.processor.set_onaudioprocess(None);
+    for idx in 0..handle.stream.get_audio_tracks().length() {
+        if let Ok(track) = handle
+            .stream
+            .get_audio_tracks()
+            .get(idx)
+            .dyn_into::<web_sys::MediaStreamTrack>()
+        {
+            track.stop();
+        }
+    }
+    let sample_rate = handle.context.sample_rate().round() as u32;
+    if let Ok(promise) = handle.context.close() {
+        let _ = JsFuture::from(promise).await;
+    }
+    encode_wav(&handle.samples.borrow(), sample_rate)
+}
+
+fn encode_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+    let mut pcm = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let value = (clamped * i16::MAX as f32) as i16;
+        pcm.extend_from_slice(&value.to_le_bytes());
+    }
+
+    let data_len = pcm.len() as u32;
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(&pcm);
+    wav
 }
 
 fn open_server_connection(
@@ -758,9 +1227,6 @@ fn handle_final_chunk(server: &mut ServerSession, chunk: StreamChunk) {
     server.pending = false;
     server.status_text = chunk.message.unwrap_or_else(|| "done".to_string());
     sync_active_response_agent_roots(server);
-    if let Some(turn) = active_response_turn_mut(server) {
-        turn.agent_details_collapsed = true;
-    }
 
     if let Some(response) = chunk.response {
         server.model = response.state.model;
@@ -799,6 +1265,29 @@ fn apply_ui_event(server: &mut ServerSession, event: UiEvent) {
         }
     };
 
+    if event.kind == "tool_stream" {
+        let tool_call_id = payload
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let channel = payload
+            .get("channel")
+            .and_then(|v| v.as_str())
+            .unwrap_or("stdout");
+        let text = payload
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if !tool_call_id.is_empty() && !text.is_empty() {
+            if let Some(entry) = find_timeline_entry_mut(&mut server.nodes, tool_call_id) {
+                append_terminal_segment(entry, channel, text);
+                server.status_text = format!("shell {} streaming", channel);
+                sync_active_response_agent_roots(server);
+            }
+        }
+        return;
+    }
+
     let agent = payload
         .get("agent")
         .and_then(|v| v.as_str())
@@ -812,11 +1301,22 @@ fn apply_ui_event(server: &mut ServerSession, event: UiEvent) {
         .get("phase")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
+    let turn = payload.get("turn").and_then(|v| v.as_u64()).unwrap_or(0);
     let event_sequence = payload.get("sequence").and_then(|v| v.as_u64());
     let event_id = payload
         .get("event_id")
         .and_then(|v| v.as_str())
         .map(ToString::to_string);
+    let tool_call_id = payload
+        .get("tool_call_id")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    let tool_name = payload
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let arguments = payload.get("arguments");
+    let result_text = payload.get("result").and_then(|v| v.as_str());
 
     server.status_text = format!("{}: {}", event.title, event.detail);
     let node_id = ensure_node(server, agent, depth);
@@ -829,14 +1329,45 @@ fn apply_ui_event(server: &mut ServerSession, event: UiEvent) {
         }
         node.reasoning_text = Some(truncate(&event.detail, 240));
         node.phase_badge = phase_badge(depth, &event.kind, phase).to_string();
-        push_timeline(
-            &mut node.timeline,
-            &event.kind,
-            phase_or_default(phase),
-            event_sequence,
-            event_id.as_deref(),
-            &event.detail,
-        );
+        if event.kind == "tool" {
+            upsert_tool_timeline(
+                &mut node.timeline,
+                tool_call_id.as_deref(),
+                tool_name,
+                phase_or_default(phase),
+                event_sequence,
+                event_id.as_deref(),
+                arguments,
+                result_text,
+                &event.detail,
+            );
+        } else if event.kind == "model" {
+            upsert_model_timeline(
+                &mut node.timeline,
+                turn,
+                phase_or_default(phase),
+                event_sequence,
+                event_id.as_deref(),
+                &event.detail,
+            );
+        } else {
+            push_timeline(
+                &mut node.timeline,
+                format!("{}-{}", event.kind, event_sequence.unwrap_or(0)),
+                &event.kind,
+                &event.detail,
+                None,
+                phase_or_default(phase),
+                event_sequence,
+                event_id.as_deref(),
+                None,
+                None,
+                None,
+                false,
+                false,
+                &event.detail,
+            );
+        }
 
         if event.kind == "model" && phase == "response_received" {
             let sent = payload
@@ -1038,11 +1569,25 @@ fn build_children(nodes: &[AgentNode], parent_id: Option<usize>) -> Vec<AgentNod
                 .timeline
                 .iter()
                 .map(|entry| ui::AgentTimelineEntryView {
-                    text: entry.text.clone(),
+                    title: entry.title.clone(),
+                    request_text: entry.request_text.clone(),
+                    response_text: entry.response_text.clone(),
                     kind: entry.kind.clone(),
                     phase: entry.phase.clone(),
                     sequence: entry.sequence,
-                    event_id: entry.event_id.clone(),
+                    request_event_id: entry.request_event_id.clone(),
+                    response_event_id: entry.response_event_id.clone(),
+                    tool_call_id: entry.tool_call_id.clone(),
+                    running: entry.running,
+                    show_terminal: entry.show_terminal,
+                    terminal_segments: entry
+                        .terminal_segments
+                        .iter()
+                        .map(|segment| ui::TerminalSegmentView {
+                            channel: segment.channel.clone(),
+                            text: segment.text.clone(),
+                        })
+                        .collect(),
                 })
                 .collect(),
             children: build_children(nodes, Some(node.id)),
@@ -1139,24 +1684,370 @@ fn phase_or_default(phase: &str) -> &str {
 
 fn push_timeline(
     lines: &mut Vec<AgentTimelineEntry>,
+    group_key: String,
     kind: &str,
+    title: &str,
+    request_text: Option<String>,
+    phase: &str,
+    sequence: Option<u64>,
+    request_event_id: Option<&str>,
+    response_event_id: Option<&str>,
+    tool_call_id: Option<&str>,
+    response_text: Option<String>,
+    running: bool,
+    show_terminal: bool,
+    fallback_text: &str,
+) {
+    lines.push(AgentTimelineEntry {
+        group_key,
+        title: title.to_string(),
+        request_text: request_text.unwrap_or_else(|| truncate(fallback_text, 180)),
+        response_text,
+        kind: kind.to_string(),
+        phase: phase.to_string(),
+        sequence,
+        request_event_id: request_event_id.map(ToString::to_string),
+        response_event_id: response_event_id.map(ToString::to_string),
+        tool_call_id: tool_call_id.map(ToString::to_string),
+        running,
+        show_terminal,
+        terminal_segments: Vec::new(),
+    });
+    trim_timeline(lines);
+}
+
+fn upsert_model_timeline(
+    lines: &mut Vec<AgentTimelineEntry>,
+    turn: u64,
     phase: &str,
     sequence: Option<u64>,
     event_id: Option<&str>,
     detail: &str,
 ) {
-    let text = truncate(&format!("{kind} | {phase} | {detail}"), 180);
+    let key = format!("model-turn-{turn}");
+    let title = format!("Model call turn {turn}");
+    if let Some(entry) = lines.iter_mut().rev().find(|entry| entry.group_key == key) {
+        entry.phase = phase.to_string();
+        entry.sequence = sequence;
+        if phase == "request_started" {
+            entry.request_text = truncate(detail, 220);
+            entry.request_event_id = event_id.map(ToString::to_string);
+            entry.running = true;
+        } else {
+            entry.response_text = Some(truncate(detail, 220));
+            entry.response_event_id = event_id.map(ToString::to_string);
+            entry.running = false;
+        }
+        return;
+    }
+
+    let is_request = phase == "request_started";
+    push_timeline(
+        lines,
+        key,
+        "model",
+        &title,
+        Some(truncate(detail, 220)),
+        phase,
+        sequence,
+        if is_request { event_id } else { None },
+        if is_request { None } else { event_id },
+        None,
+        if is_request {
+            None
+        } else {
+            Some(truncate(detail, 220))
+        },
+        is_request,
+        false,
+        detail,
+    );
+}
+
+fn upsert_tool_timeline(
+    lines: &mut Vec<AgentTimelineEntry>,
+    tool_call_id: Option<&str>,
+    tool_name: &str,
+    phase: &str,
+    sequence: Option<u64>,
+    event_id: Option<&str>,
+    arguments: Option<&serde_json::Value>,
+    result_text: Option<&str>,
+    detail: &str,
+) {
+    let Some(tool_call_id) = tool_call_id.filter(|id| !id.trim().is_empty()) else {
+        push_timeline(
+            lines,
+            format!("tool-{}", sequence.unwrap_or(0)),
+            "tool",
+            &format!("Tool call {tool_name}"),
+            Some(truncate(detail, 220)),
+            phase,
+            sequence,
+            event_id,
+            None,
+            None,
+            None,
+            phase == "start",
+            false,
+            detail,
+        );
+        return;
+    };
+
+    let request_summary = tool_request_summary(tool_name, arguments);
+    let response_summary = tool_response_summary(tool_name, detail, result_text);
+    let running = phase == "start";
+    let show_terminal = tool_name == "shell_exec";
+
+    if let Some(entry) = lines
+        .iter_mut()
+        .rev()
+        .find(|entry| entry.group_key == format!("tool-{tool_call_id}"))
+    {
+        entry.phase = phase.to_string();
+        entry.sequence = sequence;
+        entry.request_text = request_summary.clone();
+        entry.running = running;
+        entry.show_terminal = show_terminal;
+        if phase == "start" {
+            entry.request_event_id = event_id.map(ToString::to_string);
+        } else {
+            entry.response_event_id = event_id.map(ToString::to_string);
+            entry.response_text = response_summary.clone();
+        }
+        if show_terminal && phase == "start" && entry.terminal_segments.is_empty() {
+            if let Some(command) = extract_shell_command(arguments) {
+                entry.terminal_segments.push(TerminalSegment {
+                    channel: "system".to_string(),
+                    text: format!("$ {command}\n"),
+                });
+            }
+        }
+        if show_terminal && phase == "finish" && result_text.is_some() {
+            let command =
+                shell_command_from_entry(entry).or_else(|| extract_shell_command(arguments));
+            entry.terminal_segments =
+                build_shell_terminal_segments(command.as_deref(), result_text);
+        }
+        return;
+    }
+
+    let mut terminal_segments = Vec::new();
+    if show_terminal && phase == "start" {
+        if let Some(command) = extract_shell_command(arguments) {
+            terminal_segments.push(TerminalSegment {
+                channel: "system".to_string(),
+                text: format!("$ {command}\n"),
+            });
+        }
+    }
+    if show_terminal && phase == "finish" && result_text.is_some() {
+        terminal_segments =
+            build_shell_terminal_segments(extract_shell_command(arguments).as_deref(), result_text);
+    }
+
     lines.push(AgentTimelineEntry {
-        text,
-        kind: kind.to_string(),
+        group_key: format!("tool-{tool_call_id}"),
+        title: format!("Tool call {tool_name}"),
+        request_text: request_summary,
+        response_text: if phase == "finish" {
+            response_summary
+        } else {
+            None
+        },
+        kind: "tool".to_string(),
         phase: phase.to_string(),
         sequence,
-        event_id: event_id.map(ToString::to_string),
+        request_event_id: if phase == "start" {
+            event_id.map(ToString::to_string)
+        } else {
+            None
+        },
+        response_event_id: if phase == "finish" {
+            event_id.map(ToString::to_string)
+        } else {
+            None
+        },
+        tool_call_id: Some(tool_call_id.to_string()),
+        running,
+        show_terminal,
+        terminal_segments,
     });
+    trim_timeline(lines);
+}
+
+fn trim_timeline(lines: &mut Vec<AgentTimelineEntry>) {
     if lines.len() > 40 {
         let drain = lines.len() - 40;
         lines.drain(0..drain);
     }
+}
+
+fn find_timeline_entry_mut<'a>(
+    nodes: &'a mut [AgentNode],
+    tool_call_id: &str,
+) -> Option<&'a mut AgentTimelineEntry> {
+    for node in nodes {
+        if let Some(entry) = node
+            .timeline
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.tool_call_id.as_deref() == Some(tool_call_id))
+        {
+            return Some(entry);
+        }
+    }
+    None
+}
+
+fn append_terminal_segment(entry: &mut AgentTimelineEntry, channel: &str, text: &str) {
+    let text = strip_ansi(text);
+    if text.is_empty() {
+        return;
+    }
+
+    if let Some(last) = entry.terminal_segments.last_mut() {
+        if last.channel == channel {
+            last.text.push_str(&text);
+            return;
+        }
+    }
+
+    entry.terminal_segments.push(TerminalSegment {
+        channel: channel.to_string(),
+        text,
+    });
+}
+
+fn extract_shell_command(arguments: Option<&serde_json::Value>) -> Option<String> {
+    let arguments = arguments?;
+    if let Some(raw) = arguments.as_str() {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+            return extract_shell_command(Some(&parsed));
+        }
+        return None;
+    }
+
+    arguments
+        .get("command")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+}
+
+fn shell_command_from_entry(entry: &AgentTimelineEntry) -> Option<String> {
+    let first = entry.terminal_segments.first()?;
+    if first.channel != "system" {
+        return None;
+    }
+    first
+        .text
+        .strip_prefix("$ ")
+        .map(|value| value.trim_end_matches('\n').to_string())
+}
+
+fn build_shell_terminal_segments(
+    command: Option<&str>,
+    result_text: Option<&str>,
+) -> Vec<TerminalSegment> {
+    let mut segments = Vec::new();
+    if let Some(command) = command.filter(|value| !value.trim().is_empty()) {
+        segments.push(TerminalSegment {
+            channel: "system".to_string(),
+            text: format!("$ {command}\n"),
+        });
+    }
+
+    let Some(result_text) = result_text else {
+        return segments;
+    };
+
+    let mut current_channel = "system".to_string();
+    for line in strip_ansi(result_text).lines() {
+        let next_channel = match line {
+            "--- stdout ---" => Some("stdout"),
+            "--- stderr ---" => Some("stderr"),
+            _ => None,
+        };
+        if let Some(channel) = next_channel {
+            current_channel = channel.to_string();
+            continue;
+        }
+        push_terminal_line(&mut segments, &current_channel, line);
+    }
+
+    segments
+}
+
+fn tool_request_summary(tool_name: &str, arguments: Option<&serde_json::Value>) -> String {
+    if tool_name == "shell_exec" {
+        return extract_shell_command(arguments)
+            .map(|command| truncate(&format!("command: {command}"), 220))
+            .unwrap_or_else(|| "command: (unknown)".to_string());
+    }
+
+    let argument_text = arguments
+        .map(format_tool_arguments)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "(no arguments)".to_string());
+    truncate(&argument_text, 220)
+}
+
+fn tool_response_summary(
+    tool_name: &str,
+    detail: &str,
+    result_text: Option<&str>,
+) -> Option<String> {
+    if tool_name == "shell_exec" {
+        return Some(truncate(detail, 220));
+    }
+    result_text
+        .map(|result| truncate(&strip_ansi(result), 220))
+        .or_else(|| Some(truncate(detail, 220)))
+}
+
+fn format_tool_arguments(arguments: &serde_json::Value) -> String {
+    if let Some(raw) = arguments.as_str() {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+            return format_tool_arguments(&parsed);
+        }
+        return raw.to_string();
+    }
+
+    serde_json::to_string(arguments).unwrap_or_else(|_| arguments.to_string())
+}
+
+fn push_terminal_line(segments: &mut Vec<TerminalSegment>, channel: &str, line: &str) {
+    let mut text = line.to_string();
+    text.push('\n');
+    if let Some(last) = segments.last_mut() {
+        if last.channel == channel {
+            last.text.push_str(&text);
+            return;
+        }
+    }
+    segments.push(TerminalSegment {
+        channel: channel.to_string(),
+        text,
+    });
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            let _ = chars.next();
+            while let Some(next) = chars.next() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn truncate(input: &str, max: usize) -> String {
@@ -1398,7 +2289,7 @@ fn hydrate_agent_details_from_ui_events(server: &mut ServerSession, events: &[Ui
         if let Some(turn) = server.turns.get_mut(assistant_indices[i]) {
             turn.agent_roots = roots;
             turn.agent_details_enabled = !turn.agent_roots.is_empty();
-            turn.agent_details_collapsed = true;
+            turn.agent_details_collapsed = false;
         }
     }
 }

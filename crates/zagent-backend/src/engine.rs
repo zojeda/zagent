@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tracing::{Instrument, Span, info_span};
-use zagent_core::agent::{AgentConfig, AgentProgressEvent, run_agent_loop_with_progress};
+use zagent_core::agent::{
+    AgentConfig, AgentProgressEvent, ContextManagementPolicy, run_agent_loop_with_progress,
+};
 use zagent_core::config::load_config;
 use zagent_core::provider::StaticProviderResolver;
 use zagent_core::provider::configured::{
@@ -76,6 +78,7 @@ pub struct BackendOptions {
     pub session_store: SessionStoreTarget,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
+    pub context_management_policy: Option<ContextManagementPolicy>,
     pub working_dir: String,
     pub session_dir: Option<String>,
     pub resume_session: Option<String>,
@@ -90,6 +93,7 @@ impl Default for BackendOptions {
             session_store: SessionStoreTarget::Surreal,
             model: None,
             system_prompt: None,
+            context_management_policy: None,
             working_dir: std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| ".".to_string()),
@@ -97,6 +101,31 @@ impl Default for BackendOptions {
             resume_session: None,
             new_session: None,
             max_turns: 50,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddedBackendOptions {
+    pub provider_name: String,
+    pub config: AgentConfig,
+    pub working_dir: String,
+    pub session_store: SessionStoreTarget,
+    pub session_dir: String,
+    pub resume_session: Option<String>,
+    pub new_session: Option<String>,
+}
+
+impl Default for EmbeddedBackendOptions {
+    fn default() -> Self {
+        Self {
+            provider_name: "openai".to_string(),
+            config: AgentConfig::default(),
+            working_dir: ".".to_string(),
+            session_store: SessionStoreTarget::Memory,
+            session_dir: ".".to_string(),
+            resume_session: None,
+            new_session: None,
         }
     }
 }
@@ -252,11 +281,16 @@ impl BackendEngine {
             &providers,
         )?;
         let provider_name = select_initial_provider(&options, &app_config, &providers)?;
+        let context_management_policy = options
+            .context_management_policy
+            .clone()
+            .unwrap_or_else(|| app_config.resolved_context_management_policy());
 
         let mut config = AgentConfig {
             model: options.model.unwrap_or_default(),
             custom_agent_default_model: resolve_workspace_default_model(&app_config, &providers)?,
             max_turns: options.max_turns,
+            context_management_policy,
             ..AgentConfig::default()
         };
         if config.model.trim().is_empty() {
@@ -313,6 +347,60 @@ impl BackendEngine {
             state: Mutex::new(EngineState {
                 config,
                 provider_name,
+                usage: usage_from_session(&session),
+                session,
+                session_span,
+                runtime,
+            }),
+        };
+
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    pub async fn new_embedded(
+        providers: HashMap<String, Arc<dyn Provider>>,
+        runtime: RuntimeBundle,
+        options: EmbeddedBackendOptions,
+    ) -> Result<Self, zagent_core::Error> {
+        if providers.is_empty() {
+            return Err(zagent_core::Error::config(
+                "Embedded engine requires at least one configured provider",
+            ));
+        }
+        if !providers.contains_key(&options.provider_name) {
+            return Err(zagent_core::Error::config(format!(
+                "Provider '{}' is not configured",
+                options.provider_name
+            )));
+        }
+
+        let mut session = resolve_session(
+            runtime.session_store.as_ref(),
+            options.resume_session.as_deref(),
+            options.new_session.as_deref(),
+            &options.provider_name,
+            &options.config,
+            &options.working_dir,
+        )
+        .await?;
+
+        session.meta.model = options.config.model.clone();
+        session.meta.provider = options.provider_name.clone();
+        runtime.session_store.save_session(&session).await?;
+        let session_span = build_session_span(&session);
+
+        let inner = EngineInner {
+            providers,
+            mcp_servers_config: Default::default(),
+            working_dir: options.working_dir,
+            session_dir: options.session_dir,
+            session_store: options.session_store,
+            turn_lock: Mutex::new(()),
+            state: Mutex::new(EngineState {
+                config: options.config,
+                provider_name: options.provider_name,
                 usage: usage_from_session(&session),
                 session,
                 session_span,
@@ -609,6 +697,7 @@ impl BackendEngine {
             manager,
             http_client,
             tools,
+            workspace_fs,
             store,
             session_span,
             provider_name,
@@ -622,6 +711,7 @@ impl BackendEngine {
                 state.runtime.mcp_manager.clone(),
                 state.runtime.http_client.clone(),
                 state.runtime.tools.clone(),
+                state.runtime.workspace_fs.clone(),
                 state.runtime.session_store.clone(),
                 state.session_span.clone(),
                 state.provider_name.clone(),
@@ -665,6 +755,7 @@ impl BackendEngine {
             http_client.as_ref(),
             &provider_resolver,
             tools.as_ref(),
+            workspace_fs.as_deref(),
             &mut session,
             Some(store.as_ref()),
             &config,
@@ -999,6 +1090,7 @@ fn progress_event_to_ui_event(event: AgentProgressEvent) -> Option<UiEvent> {
         AgentProgressEvent::ToolCallStarted {
             agent,
             handoff_depth,
+            tool_call_id,
             tool_name,
             arguments,
         } => Some(UiEvent {
@@ -1009,6 +1101,7 @@ fn progress_event_to_ui_event(event: AgentProgressEvent) -> Option<UiEvent> {
                 "phase": "start",
                 "agent": agent,
                 "handoff_depth": handoff_depth,
+                "tool_call_id": tool_call_id,
                 "tool_name": tool_name,
                 "arguments": arguments
             })),
@@ -1016,6 +1109,7 @@ fn progress_event_to_ui_event(event: AgentProgressEvent) -> Option<UiEvent> {
         AgentProgressEvent::ToolCallFinished {
             agent,
             handoff_depth,
+            tool_call_id,
             tool_name,
             success,
             latency_ms,
@@ -1032,6 +1126,7 @@ fn progress_event_to_ui_event(event: AgentProgressEvent) -> Option<UiEvent> {
                 "phase": "finish",
                 "agent": agent,
                 "handoff_depth": handoff_depth,
+                "tool_call_id": tool_call_id,
                 "tool_name": tool_name,
                 "success": success,
                 "latency_ms": latency_ms,
